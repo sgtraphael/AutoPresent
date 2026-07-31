@@ -19,7 +19,21 @@ _PPTX_NSMAP = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
-
+def split_into_chunks(text: str, max_words: int = 12) -> list[str]:
+    """Split text into reasonably sized speaking chunks."""
+    import re
+    # Split on sentence endings first
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    for sent in sentences:
+        words = sent.split()
+        if not words:
+            continue
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i:i + max_words])
+            if chunk:
+                chunks.append(chunk)
+    return chunks
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -51,8 +65,7 @@ class TTSEngine:
 
     # ------------------------------------------------------------------
     # GUI-thread helpers
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------    
     def get_voices_sync(self):
         """
         Return a list of objects with .name and .id attributes.
@@ -337,15 +350,16 @@ class Presenter:
                 notes = self._ppt.get_notes(idx)
 
                 if notes:
-                    # Keep re-speaking the same notes until the slide finishes
-                    # without being paused, or until Stop is pressed.
-                    while not self._stop_event.is_set():
-                        self._on_status_change(
-                            f"Slide {slide_num} / {total}  —  Speaking…"
-                        )
-                        self._tts.speak_async(notes)
+                    chunks = split_into_chunks(notes)
+                    chunk_idx = 0
 
-                        # Wait until speech finishes OR stop/pause is requested
+                    while chunk_idx < len(chunks) and not self._stop_event.is_set():
+                        self._on_status_change(
+                            f"Slide {slide_num} / {total}  —  Speaking… ({chunk_idx+1}/{len(chunks)})"
+                        )
+                        self._tts.speak_async(chunks[chunk_idx])
+
+                        # Wait until this chunk finishes OR stop/pause
                         paused = False
                         while True:
                             if self._stop_event.is_set():
@@ -364,16 +378,17 @@ class Presenter:
                             break
 
                         if paused:
-                            # Wait here until user presses Resume (or Stop)
+                            # Wait until Resume or Stop
                             while not self._pause_event.is_set():
                                 if self._stop_event.is_set():
                                     break
                                 time.sleep(0.05)
-                            # After resume → loop back and speak the notes again
+                            # After resume → continue from the SAME chunk
+                            # (or change to chunk_idx += 1 if you prefer skipping the interrupted chunk)
                             continue
 
-                        # Speech finished normally → leave the while and go to next slide
-                        break
+                        # This chunk finished normally → go to next chunk
+                        chunk_idx += 1
 
                 else:
                     # No notes: brief pause so the slide is visible
