@@ -19,7 +19,21 @@ _PPTX_NSMAP = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
-
+def split_into_chunks(text: str, max_words: int = 12) -> list[str]:
+    """Split text into reasonably sized speaking chunks."""
+    import re
+    # Split on sentence endings first
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    for sent in sentences:
+        words = sent.split()
+        if not words:
+            continue
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i:i + max_words])
+            if chunk:
+                chunks.append(chunk)
+    return chunks
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -51,8 +65,7 @@ class TTSEngine:
 
     # ------------------------------------------------------------------
     # GUI-thread helpers
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------    
     def get_voices_sync(self):
         """
         Return a list of objects with .name and .id attributes.
@@ -120,21 +133,32 @@ class TTSEngine:
                         self._voice.Voice = tok
                         break
 
-    def speak(self, text: str):
-        """Blocking speak. Must be called from the presenter thread."""
+    def speak_async(self, text: str):
+        """Start speaking asynchronously. Must be called from the presenter thread."""
         self._apply_pending()
-        # SVSFDefault (0) = synchronous/blocking
-        self._voice.Speak(text, self._SVSFDefault)
+        # 1 = SVSFlagsAsync
+        self._voice.Speak(text, 1)
+
+    def is_speaking(self) -> bool:
+        """True while the voice is still producing audio."""
+        if not self._voice:
+            return False
+        try:
+            return self._voice.Status.RunningState != 0
+        except Exception:
+            return False
 
     def stop(self):
-        """Interrupt current speech. Safe to call from any thread."""
+        """
+        Interrupt current speech.
+        MUST be called from the presenter thread (the one that owns the SpVoice).
+        """
         if self._voice:
             try:
-                # Speak empty string with Purge flag to stop immediately
-                self._voice.Speak("", self._SVSFlagsAsync | self._SVSFPurgeBeforeSpeak)
+                # Purge + async empty speak
+                self._voice.Speak("", 1 | 2)   # SVSFlagsAsync | SVSFPurgeBeforeSpeak
             except Exception:
                 pass
-
 
 # ---------------------------------------------------------------------------
 # PowerPoint controller
@@ -270,18 +294,19 @@ class Presenter:
 
     def pause(self):
         self._pause_event.clear()
-        self._tts.stop()
+        # Do NOT call self._tts.stop() here – the presenter thread will do it
 
     def resume(self):
         self._pause_event.set()
 
     def stop(self):
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
-        self._tts.stop()
-
+        self._pause_event.set()   # unblock any wait
+        # again, do NOT call tts.stop() from the GUI thread
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+# In Presenter._run() – replace the whole method body (keep the def line)
 
     def _run(self):
         """
@@ -309,7 +334,7 @@ class Presenter:
                 if self._stop_event.is_set():
                     break
 
-                # Wait while paused
+                # Honour pause before starting the slide
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     break
@@ -325,10 +350,46 @@ class Presenter:
                 notes = self._ppt.get_notes(idx)
 
                 if notes:
-                    self._on_status_change(
-                        f"Slide {slide_num} / {total}  —  Speaking…"
-                    )
-                    self._tts.speak(notes)
+                    chunks = split_into_chunks(notes)
+                    chunk_idx = 0
+
+                    while chunk_idx < len(chunks) and not self._stop_event.is_set():
+                        self._on_status_change(
+                            f"Slide {slide_num} / {total}  —  Speaking… ({chunk_idx+1}/{len(chunks)})"
+                        )
+                        self._tts.speak_async(chunks[chunk_idx])
+
+                        # Wait until this chunk finishes OR stop/pause
+                        paused = False
+                        while True:
+                            if self._stop_event.is_set():
+                                self._tts.stop()
+                                break
+                            if not self._pause_event.is_set():
+                                self._tts.stop()
+                                paused = True
+                                break
+
+                            done = self._tts._voice.WaitUntilDone(100)
+                            if done:
+                                break
+
+                        if self._stop_event.is_set():
+                            break
+
+                        if paused:
+                            # Wait until Resume or Stop
+                            while not self._pause_event.is_set():
+                                if self._stop_event.is_set():
+                                    break
+                                time.sleep(0.05)
+                            # After resume → continue from the SAME chunk
+                            # (or change to chunk_idx += 1 if you prefer skipping the interrupted chunk)
+                            continue
+
+                        # This chunk finished normally → go to next chunk
+                        chunk_idx += 1
+
                 else:
                     # No notes: brief pause so the slide is visible
                     self._on_status_change(
@@ -338,6 +399,8 @@ class Presenter:
                         if self._stop_event.is_set():
                             break
                         self._pause_event.wait()
+                        if self._stop_event.is_set():
+                            break
                         time.sleep(0.1)
 
             if not self._stop_event.is_set():
@@ -348,7 +411,6 @@ class Presenter:
             # Close COM objects on the same thread they were created on
             self._ppt.close()
             pythoncom.CoUninitialize()
-
 
 # ---------------------------------------------------------------------------
 # GUI
