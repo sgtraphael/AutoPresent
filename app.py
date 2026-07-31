@@ -29,35 +29,44 @@ class TTSEngine:
     """
     Text-to-speech using Windows SAPI (SpVoice) directly via win32com.
 
-    All speak() / stop() calls must come from the presenter background thread
-    (the same thread that called CoInitialize).  The GUI thread only calls
-    get_voices_sync(), set_rate(), set_volume(), set_voice() which are safe
-    because they only read/write plain Python values protected by a lock.
+    Threading model
+    ---------------
+    - _init_engine() and speak() run on the presenter background thread.
+      The SpVoice COM object is NEVER touched from the GUI thread.
+    - pause() / resume() / stop() only set threading.Event flags.
+      The speak() polling loop reads those flags and calls voice.Pause()
+      / voice.Resume() / voice.Skip() all from the presenter thread.
+    - get_voices_sync() / set_*() are safe to call from any thread.
     """
 
-    # SAPI speak flags
-    _SVSFDefault        = 0
-    _SVSFlagsAsync      = 1   # non-blocking (we use blocking mode = 0)
-    _SVSFPurgeBeforeSpeak = 2
+    # SAPI RunningState values
+    _RS_DONE    = 0
+    _RS_PAUSED  = 1
+    _RS_SPEAKING = 2
+
+    # SAPI Speak flags
+    _ASYNC = 1           # start speaking without blocking
+    _PURGE = 2           # stop & clear the queue
 
     def __init__(self):
-        self._voice = None          # win32com SpVoice — created on presenter thread
-        self._lock  = threading.Lock()
+        self._voice = None
 
-        # Settings queued from GUI thread, applied before each speak()
-        self._pending_rate:  int   | None = None   # SAPI rate: -10 .. +10
-        self._pending_volume: int  | None = None   # SAPI volume: 0..100
-        self._pending_voice_name: str | None = None
+        # Settings queued from GUI thread, flushed in _apply_pending()
+        self._lock = threading.Lock()
+        self._pending_rate:        int | None = None
+        self._pending_volume:      int | None = None
+        self._pending_voice_name:  str | None = None
+
+        # Control flags set by GUI thread, polled by presenter thread
+        self._stop_flag  = threading.Event()
+        self._pause_flag = threading.Event()   # set = paused
 
     # ------------------------------------------------------------------
-    # GUI-thread helpers
+    # GUI-thread helpers (no COM access)
     # ------------------------------------------------------------------
 
     def get_voices_sync(self):
-        """
-        Return a list of objects with .name and .id attributes.
-        Creates a temporary SpVoice just for enumeration, then releases it.
-        """
+        """Enumerate SAPI voices. Returns objects with .name / .id."""
         pythoncom.CoInitialize()
         try:
             v = win32com.client.Dispatch("SAPI.SpVoice")
@@ -65,11 +74,10 @@ class TTSEngine:
             voices = []
             for i in range(tokens.Count):
                 tok = tokens.Item(i)
-                class _V:
-                    pass
+                class _V: pass
                 vobj = _V()
                 vobj.name = tok.GetDescription()
-                vobj.id   = tok.GetDescription()   # use name as ID
+                vobj.id   = tok.GetDescription()
                 voices.append(vobj)
             del v
             return voices
@@ -77,21 +85,33 @@ class TTSEngine:
             pythoncom.CoUninitialize()
 
     def set_rate(self, rate_wpm: int):
-        """Map words-per-minute (80-300) to SAPI rate (-10 to +10)."""
-        # 175 wpm → 0, range roughly 80→-5, 300→+10
+        """Map wpm (80-300) → SAPI rate (-10..+10)."""
         sapi_rate = int((rate_wpm - 175) / 12.5)
         sapi_rate = max(-10, min(10, sapi_rate))
         with self._lock:
             self._pending_rate = sapi_rate
 
     def set_volume(self, volume: float):
-        """Map 0.0-1.0 to SAPI volume 0-100."""
+        """Map 0.0-1.0 → SAPI volume 0-100."""
         with self._lock:
             self._pending_volume = int(volume * 100)
 
     def set_voice(self, voice_name: str):
         with self._lock:
             self._pending_voice_name = voice_name
+
+    def pause(self):
+        """Signal speak() loop to pause. GUI-thread safe."""
+        self._pause_flag.set()
+
+    def resume(self):
+        """Signal speak() loop to resume. GUI-thread safe."""
+        self._pause_flag.clear()
+
+    def stop(self):
+        """Signal speak() loop to abort. GUI-thread safe."""
+        self._stop_flag.set()
+        self._pause_flag.clear()   # unblock if paused
 
     # ------------------------------------------------------------------
     # Presenter-thread methods
@@ -100,9 +120,11 @@ class TTSEngine:
     def _init_engine(self):
         """Create SpVoice on the presenter thread. Called once from _run()."""
         self._voice = win32com.client.Dispatch("SAPI.SpVoice")
+        self._stop_flag.clear()
+        self._pause_flag.clear()
 
     def _apply_pending(self):
-        """Flush queued settings into the SpVoice object."""
+        """Flush queued property changes into SpVoice."""
         with self._lock:
             if self._pending_rate is not None:
                 self._voice.Rate = self._pending_rate
@@ -120,20 +142,49 @@ class TTSEngine:
                         self._voice.Voice = tok
                         break
 
-    def speak(self, text: str):
-        """Blocking speak. Must be called from the presenter thread."""
+    def speak(self, text: str) -> bool:
+        """
+        Speak text and block until done, paused-then-resumed, or stopped.
+        Must be called from the presenter thread.
+        Returns True if speech completed normally, False if interrupted.
+        """
+        # Clear stop flag; pause_flag is intentionally NOT cleared here —
+        # the caller (Presenter.resume) already cleared it before calling speak().
+        self._stop_flag.clear()
         self._apply_pending()
-        # SVSFDefault (0) = synchronous/blocking
-        self._voice.Speak(text, self._SVSFDefault)
 
-    def stop(self):
-        """Interrupt current speech. Safe to call from any thread."""
-        if self._voice:
-            try:
-                # Speak empty string with Purge flag to stop immediately
-                self._voice.Speak("", self._SVSFlagsAsync | self._SVSFPurgeBeforeSpeak)
-            except Exception:
-                pass
+        # Start speaking asynchronously so this thread stays unblocked
+        self._voice.Speak(text, self._ASYNC)
+
+        currently_paused = False
+
+        while True:
+            # --- stop requested ---
+            if self._stop_flag.is_set():
+                self._voice.Speak("", self._ASYNC | self._PURGE)
+                return False
+
+            # --- pause requested ---
+            if self._pause_flag.is_set():
+                if not currently_paused:
+                    self._voice.Pause()
+                    currently_paused = True
+                time.sleep(0.05)
+                continue
+
+            # --- resume if we were paused ---
+            if currently_paused:
+                self._voice.Resume()
+                currently_paused = False
+
+            state = self._voice.Status.RunningState
+            if state != self._RS_SPEAKING:
+                # Speech finished (or was already done)
+                break
+
+            time.sleep(0.05)
+
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +264,13 @@ class PPTController:
                     break
             except Exception:
                 pass
+        # Give the window a moment to settle, then force slide 1
+        time.sleep(0.3)
+        if self._slideshow is not None:
+            try:
+                self._slideshow.GotoSlide(1)
+            except Exception:
+                pass
 
     def goto_slide(self, slide_number: int):
         """Jump to a 1-based slide number. Must be called on the same thread as open_slideshow()."""
@@ -269,16 +327,21 @@ class Presenter:
         self._thread.start()
 
     def pause(self):
+        # First tell TTS to pause (sets _pause_flag → speak() calls voice.Pause())
+        self._tts.pause()
+        # Then block the between-slide loop
         self._pause_event.clear()
-        self._tts.stop()
 
     def resume(self):
+        # First clear TTS pause flag so speak() calls voice.Resume()
+        self._tts.resume()
+        # Then unblock the between-slide loop
         self._pause_event.set()
 
     def stop(self):
+        self._tts.stop()             # purge speech immediately
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
-        self._tts.stop()
+        self._pause_event.set()      # unblock between-slide wait if paused
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -309,8 +372,11 @@ class Presenter:
                 if self._stop_event.is_set():
                     break
 
-                # Wait while paused
-                self._pause_event.wait()
+                # If paused between slides, wait here until resumed or stopped
+                while not self._pause_event.is_set():
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(0.05)
                 if self._stop_event.is_set():
                     break
 
@@ -329,16 +395,22 @@ class Presenter:
                         f"Slide {slide_num} / {total}  —  Speaking…"
                     )
                     self._tts.speak(notes)
+                    # If stopped mid-speech, break out of the slide loop
+                    if self._stop_event.is_set():
+                        break
                 else:
-                    # No notes: brief pause so the slide is visible
+                    # No notes: 3 s pause, interruptible by stop/pause
                     self._on_status_change(
                         f"Slide {slide_num} / {total}  —  No notes, waiting 3 s…"
                     )
-                    for _ in range(30):
+                    for _ in range(60):
                         if self._stop_event.is_set():
                             break
-                        self._pause_event.wait()
-                        time.sleep(0.1)
+                        if not self._pause_event.is_set():
+                            # paused — keep waiting without consuming the timer
+                            time.sleep(0.05)
+                            continue
+                        time.sleep(0.05)
 
             if not self._stop_event.is_set():
                 self._on_status_change("Presentation finished.")
