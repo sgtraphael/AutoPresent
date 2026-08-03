@@ -1,8 +1,10 @@
 build/
 dist/
 AutoPresent.spec
-.onnx
-.onnx.json
+
+*.onnx
+*.onnx.json
+*.docx
 
 build.txt
 en_US-amy-medium.onnx
