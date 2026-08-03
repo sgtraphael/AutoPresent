@@ -1,0 +1,5 @@
+python-pptx
+lxml
+pywin32
+piper-tts
+onnxruntime
