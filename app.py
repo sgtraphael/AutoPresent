@@ -170,6 +170,7 @@ class PiperTTSEngine:
         self._stop_flag = False
         self._is_playing = False
         self._pending_rate = 1.0
+        self._pending_volume = 1.0
         self._current_voice_id = "en_US-lessac-high"
         self._voices = {}
 
@@ -223,13 +224,14 @@ class PiperTTSEngine:
         with self._lock:
             self._pending_rate = scale
 
-    def set_volume(self, volume: float):
-        pass
-
     def set_voice(self, voice_name: str):
         if voice_name in self._voices:
             with self._lock:
                 self._current_voice_id = voice_name
+                
+    def set_volume(self, volume: float):
+        with self._lock:
+            self._pending_volume = max(0.0, min(1.0, float(volume)))
 
     def speak_async(self, text: str):
         self._stop_flag = False
@@ -239,17 +241,31 @@ class PiperTTSEngine:
             temp_path = None
             try:
                 with self._lock:
-                    length_scale = self._pending_rate
+                    length_scale = getattr(self, "_pending_rate", 1.0)
+                    volume = getattr(self, "_pending_volume", 1.0)
                     voice = self._voices[self._current_voice_id]
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
                     temp_path = f.name
 
                 with wave.open(temp_path, "wb") as wav_file:
-                    voice.synthesize_wav(text, wav_file)
+                    # Preferred modern way
+                    try:
+                        from piper.config import SynthesisConfig
+                        syn_config = SynthesisConfig(length_scale=length_scale)
+                        voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+                    except Exception:
+                        # Fallback for older piper versions
+                        try:
+                            voice.synthesize_wav(text, wav_file, length_scale=length_scale)
+                        except TypeError:
+                            voice.synthesize_wav(text, wav_file)
 
                 if self._stop_flag:
                     return
+
+                if volume < 0.99:
+                    self._apply_volume(temp_path, volume)
 
                 winsound.PlaySound(temp_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
 
@@ -276,6 +292,36 @@ class PiperTTSEngine:
                         pass
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_volume(self, wav_path: str, volume: float):
+        import array
+
+        with wave.open(wav_path, "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            frames = wf.readframes(nframes)
+
+        if sampwidth != 2:
+            return
+
+        samples = array.array("h")
+        samples.frombytes(frames)
+
+        for i in range(len(samples)):
+            val = int(samples[i] * volume)
+            if val > 32767:
+                val = 32767
+            elif val < -32768:
+                val = -32768
+            samples[i] = val
+
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(nchannels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(framerate)
+            wf.writeframes(samples.tobytes())
 
     def is_speaking(self) -> bool:
         return self._is_playing

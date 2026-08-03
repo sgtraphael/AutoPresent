@@ -3,6 +3,8 @@ dist/
 AutoPresent.spec
 .onnx
 .onnx.json
+
+build.txt
 en_US-amy-medium.onnx
 en_US-amy-medium.onnx.json
 en_US-lessac-high.onnx
