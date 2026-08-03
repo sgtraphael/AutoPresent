@@ -159,7 +159,104 @@ class TTSEngine:
                 self._voice.Speak("", 1 | 2)   # SVSFlagsAsync | SVSFPurgeBeforeSpeak
             except Exception:
                 pass
+import wave
+import winsound
+import tempfile
+from piper import PiperVoice
 
+class PiperTTSEngine:
+    def __init__(self, model_path: str = None):
+        self._lock = threading.Lock()
+        self._stop_flag = False
+        self._is_playing = False
+        self._pending_rate = 1.0
+
+        if model_path is None:
+            # Common locations after download_voices
+            possible_paths = [
+                os.path.expanduser("~/.local/share/piper/voices/en_US-lessac-medium.onnx"),
+                os.path.expanduser("~/AppData/Local/piper/voices/en_US-lessac-medium.onnx"),
+                "en_US-lessac-medium.onnx",
+                os.path.join(os.path.dirname(__file__), "en_US-lessac-medium.onnx"),
+            ]
+            for p in possible_paths:
+                if os.path.exists(p):
+                    model_path = p
+                    break
+            else:
+                raise FileNotFoundError("Piper voice model not found. Please download it first.")
+
+        self.voice = PiperVoice.load(model_path)
+
+    def get_voices_sync(self):
+        class _V: pass
+        v = _V()
+        v.name = "Piper - en_US-lessac-medium (Neural)"
+        v.id = "en_US-lessac-medium"
+        return [v]
+
+    def set_rate(self, rate_wpm: int):
+        scale = 175 / max(80, min(300, rate_wpm))
+        with self._lock:
+            self._pending_rate = scale
+
+    def set_volume(self, volume: float):
+        pass
+
+    def set_voice(self, voice_name: str):
+        pass
+
+    def speak_async(self, text: str):
+        self._stop_flag = False
+        self._is_playing = True
+
+        def _run():
+            try:
+                with self._lock:
+                    length_scale = self._pending_rate
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+                    temp_path = f.name
+
+                with wave.open(temp_path, "wb") as wav_file:
+                    self.voice.synthesize(text, wav_file, length_scale=length_scale)
+
+                if self._stop_flag:
+                    try: os.unlink(temp_path)
+                    except: pass
+                    self._is_playing = False
+                    return
+
+                winsound.PlaySound(temp_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+
+                # Approximate wait (winsound has limited status)
+                # We rely on the stop flag
+                while not self._stop_flag:
+                    time.sleep(0.15)
+                    # Simple timeout based on text length (rough)
+                    break
+
+                winsound.PlaySound(None, winsound.SND_PURGE)
+
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+
+            except Exception as e:
+                print(f"Piper error: {e}")
+            finally:
+                self._is_playing = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def is_speaking(self) -> bool:
+        return self._is_playing
+
+    def stop(self):
+        self._stop_flag = True
+        self._is_playing = False
+        winsound.PlaySound(None, winsound.SND_PURGE)
 # ---------------------------------------------------------------------------
 # PowerPoint controller
 # ---------------------------------------------------------------------------
@@ -317,7 +414,9 @@ class Presenter:
         pythoncom.CoInitialize()
         try:
             # Init SpVoice TTS on this thread
-            self._tts._init_engine()
+            # self._tts._init_engine()
+            if hasattr(self._tts, "_init_engine"):
+                self._tts._init_engine()
 
             # Open the slideshow on this thread
             self._on_status_change("Opening PowerPoint slideshow…")
@@ -359,7 +458,7 @@ class Presenter:
                         )
                         self._tts.speak_async(chunks[chunk_idx])
 
-                        # Wait until this chunk finishes OR stop/pause
+                        # Universal waiting loop (works for both SAPI and Piper)
                         paused = False
                         while True:
                             if self._stop_event.is_set():
@@ -369,10 +468,9 @@ class Presenter:
                                 self._tts.stop()
                                 paused = True
                                 break
-
-                            done = self._tts._voice.WaitUntilDone(100)
-                            if done:
+                            if not self._tts.is_speaking():
                                 break
+                            time.sleep(0.08)
 
                         if self._stop_event.is_set():
                             break
@@ -383,11 +481,10 @@ class Presenter:
                                 if self._stop_event.is_set():
                                     break
                                 time.sleep(0.05)
-                            # After resume → continue from the SAME chunk
-                            # (or change to chunk_idx += 1 if you prefer skipping the interrupted chunk)
+                            # After resume → re-speak the same chunk
                             continue
 
-                        # This chunk finished normally → go to next chunk
+                        # This chunk finished normally → next chunk
                         chunk_idx += 1
 
                 else:
@@ -424,7 +521,16 @@ class AutoPresentApp(tk.Tk):
         self.configure(bg="#1e1e2e")
 
         self._ppt: PPTController | None = None
-        self._tts = TTSEngine()
+        self._tts_sapi = TTSEngine()
+        try:
+            self._tts_piper = PiperTTSEngine()
+            self._has_piper = True
+        except Exception as e:
+            print(f"Piper not available: {e}")
+            self._tts_piper = None
+            self._has_piper = False
+
+        self._tts = self._tts_sapi  # default
         self._presenter: Presenter | None = None
         self._paused = False
 
@@ -508,22 +614,38 @@ class AutoPresentApp(tk.Tk):
                                    width=8)
         self._vol_label.grid(row=1, column=2, padx=(0, 8))
 
+        # Engine selector
+        tk.Label(settings_frame, text="Engine:", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
+
+        engine_values = ["SAPI (Windows)"]
+        if getattr(self, "_has_piper", False):
+            engine_values.append("Piper (Neural)")
+
+        self._engine_var = tk.StringVar(value="SAPI (Windows)")
+        self._engine_combo = ttk.Combobox(settings_frame,
+                                          textvariable=self._engine_var,
+                                          values=engine_values,
+                                          state="readonly", width=35)
+        self._engine_combo.grid(row=2, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
+        self._engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
+
         # Voice selector
         tk.Label(settings_frame, text="Voice:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=2, column=0,
+                 font=("Segoe UI", 9)).grid(row=3, column=0,
                                             padx=8, pady=4, sticky="w")
         self._voice_var = tk.StringVar()
         self._voice_combo = ttk.Combobox(settings_frame,
                                          textvariable=self._voice_var,
                                          state="readonly", width=35)
-        self._voice_combo.grid(row=2, column=1, columnspan=2,
+        self._voice_combo.grid(row=3, column=1, columnspan=2,
                                padx=8, pady=4, sticky="ew")
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
         # Start slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=3, column=0,
+                 font=("Segoe UI", 9)).grid(row=4, column=0,
                                             padx=8, pady=4, sticky="w")
         self._start_slide_var = tk.IntVar(value=1)
         self._start_slide_spin = tk.Spinbox(
@@ -533,9 +655,8 @@ class AutoPresentApp(tk.Tk):
             buttonbackground=BTN_BG, relief="flat",
             font=("Segoe UI", 9)
         )
-        self._start_slide_spin.grid(row=3, column=1, padx=8, pady=4,
+        self._start_slide_spin.grid(row=4, column=1, padx=8, pady=4,
                                      sticky="w")
-
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -637,6 +758,27 @@ class AutoPresentApp(tk.Tk):
         idx = self._voice_combo.current()
         if idx >= 0 and idx < len(self._voices):
             self._tts.set_voice(self._voices[idx].id)
+
+    def _on_engine_change(self, event=None):
+        engine = self._engine_var.get()
+        if engine.startswith("Piper") and self._has_piper:
+            self._tts = self._tts_piper
+        else:
+            self._tts = self._tts_sapi
+        self._populate_voices()
+
+    def _populate_voices(self):
+        try:
+            voices = self._tts.get_voices_sync()
+            names = [v.name for v in voices]
+            self._voices = voices
+            self._voice_combo["values"] = names
+            if names:
+                self._voice_combo.current(0)
+                self._voice_var.set(names[0])
+                self._tts.set_voice(voices[0].id)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load voices:\n{e}")
 
     def _on_start(self):
         if self._ppt is None:
