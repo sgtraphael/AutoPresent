@@ -19,7 +19,21 @@ _PPTX_NSMAP = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
-
+def split_into_chunks(text: str, max_words: int = 12) -> list[str]:
+    """Split text into reasonably sized speaking chunks."""
+    import re
+    # Split on sentence endings first
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    for sent in sentences:
+        words = sent.split()
+        if not words:
+            continue
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i:i + max_words])
+            if chunk:
+                chunks.append(chunk)
+    return chunks
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -51,8 +65,7 @@ class TTSEngine:
 
     # ------------------------------------------------------------------
     # GUI-thread helpers
-    # ------------------------------------------------------------------
-
+    # ------------------------------------------------------------------    
     def get_voices_sync(self):
         """
         Return a list of objects with .name and .id attributes.
@@ -120,22 +133,157 @@ class TTSEngine:
                         self._voice.Voice = tok
                         break
 
-    def speak(self, text: str):
-        """Blocking speak. Must be called from the presenter thread."""
+    def speak_async(self, text: str):
+        """Start speaking asynchronously. Must be called from the presenter thread."""
         self._apply_pending()
-        # SVSFDefault (0) = synchronous/blocking
-        self._voice.Speak(text, self._SVSFDefault)
+        # 1 = SVSFlagsAsync
+        self._voice.Speak(text, 1)
+
+    def is_speaking(self) -> bool:
+        if not self._voice:
+            return False
+        try:
+            # 2 = SRSEIsSpeaking
+            return self._voice.Status.RunningState == 2
+        except Exception:
+            return False
 
     def stop(self):
-        """Interrupt current speech. Safe to call from any thread."""
+        """
+        Interrupt current speech.
+        MUST be called from the presenter thread (the one that owns the SpVoice).
+        """
         if self._voice:
             try:
-                # Speak empty string with Purge flag to stop immediately
-                self._voice.Speak("", self._SVSFlagsAsync | self._SVSFPurgeBeforeSpeak)
+                # Purge + async empty speak
+                self._voice.Speak("", 1 | 2)   # SVSFlagsAsync | SVSFPurgeBeforeSpeak
             except Exception:
                 pass
+import wave
+import winsound
+import tempfile
+from piper import PiperVoice
 
+class PiperTTSEngine:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop_flag = False
+        self._is_playing = False
+        self._pending_rate = 1.0
+        self._current_voice_id = "en_US-lessac-high"
+        self._voices = {}
 
+        search_dirs = [
+            os.path.expanduser("~/.local/share/piper/voices"),
+            os.path.expanduser("~/AppData/Local/piper/voices"),
+            os.path.dirname(__file__),
+            ".",
+        ]
+
+        voice_files = {
+            "en_US-lessac-high": "en_US-lessac-high.onnx",
+            "en_US-amy-medium": "en_US-amy-medium.onnx",
+        }
+
+        for vid, filename in voice_files.items():
+            for d in search_dirs:
+                path = os.path.join(d, filename)
+                if os.path.exists(path):
+                    try:
+                        self._voices[vid] = PiperVoice.load(path)
+                        print(f"Loaded Piper voice: {vid}")
+                        break
+                    except Exception as e:
+                        print(f"Failed to load {vid}: {e}")
+
+        if not self._voices:
+            raise FileNotFoundError("No Piper voice models found.")
+
+        if "en_US-lessac-high" in self._voices:
+            self._current_voice_id = "en_US-lessac-high"
+        else:
+            self._current_voice_id = next(iter(self._voices))
+
+    def get_voices_sync(self):
+        result = []
+        display_names = {
+            "en_US-lessac-high": "Piper - Lessac High (Neural)",
+            "en_US-amy-medium": "Piper - Amy Medium (Neural)",
+        }
+        for vid in self._voices:
+            class _V: pass
+            v = _V()
+            v.id = vid
+            v.name = display_names.get(vid, vid)
+            result.append(v)
+        return result
+
+    def set_rate(self, rate_wpm: int):
+        scale = 175 / max(80, min(300, rate_wpm))
+        with self._lock:
+            self._pending_rate = scale
+
+    def set_volume(self, volume: float):
+        pass
+
+    def set_voice(self, voice_name: str):
+        if voice_name in self._voices:
+            with self._lock:
+                self._current_voice_id = voice_name
+
+    def speak_async(self, text: str):
+        self._stop_flag = False
+        self._is_playing = True
+
+        def _run():
+            temp_path = None
+            try:
+                with self._lock:
+                    length_scale = self._pending_rate
+                    voice = self._voices[self._current_voice_id]
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+                    temp_path = f.name
+
+                with wave.open(temp_path, "wb") as wav_file:
+                    voice.synthesize_wav(text, wav_file)
+
+                if self._stop_flag:
+                    return
+
+                winsound.PlaySound(temp_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+
+                try:
+                    with wave.open(temp_path, "rb") as wf:
+                        duration = wf.getnframes() / float(wf.getframerate())
+                except Exception:
+                    duration = max(1.5, len(text.split()) * 0.45)
+
+                start = time.time()
+                while not self._stop_flag and (time.time() - start) < duration + 0.4:
+                    time.sleep(0.05)
+
+                winsound.PlaySound(None, winsound.SND_PURGE)
+
+            except Exception as e:
+                print(f"Piper error: {e}")
+            finally:
+                self._is_playing = False
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def is_speaking(self) -> bool:
+        return self._is_playing
+
+    def stop(self):
+        self._stop_flag = True
+        self._is_playing = False
+        winsound.PlaySound(None, winsound.SND_PURGE)
 # ---------------------------------------------------------------------------
 # PowerPoint controller
 # ---------------------------------------------------------------------------
@@ -270,18 +418,18 @@ class Presenter:
 
     def pause(self):
         self._pause_event.clear()
-        self._tts.stop()
+        # Do NOT call self._tts.stop() here – the presenter thread will do it
 
     def resume(self):
         self._pause_event.set()
 
     def stop(self):
         self._stop_event.set()
-        self._pause_event.set()  # unblock if paused
-        self._tts.stop()
-
+        self._pause_event.set()   # unblock any wait
+        # again, do NOT call tts.stop() from the GUI thread
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
 
     def _run(self):
         """
@@ -292,7 +440,9 @@ class Presenter:
         pythoncom.CoInitialize()
         try:
             # Init SpVoice TTS on this thread
-            self._tts._init_engine()
+            # self._tts._init_engine()
+            if hasattr(self._tts, "_init_engine"):
+                self._tts._init_engine()
 
             # Open the slideshow on this thread
             self._on_status_change("Opening PowerPoint slideshow…")
@@ -309,7 +459,7 @@ class Presenter:
                 if self._stop_event.is_set():
                     break
 
-                # Wait while paused
+                # Honour pause before starting the slide
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     break
@@ -325,10 +475,43 @@ class Presenter:
                 notes = self._ppt.get_notes(idx)
 
                 if notes:
-                    self._on_status_change(
-                        f"Slide {slide_num} / {total}  —  Speaking…"
-                    )
-                    self._tts.speak(notes)
+                    chunks = split_into_chunks(notes)
+                    chunk_idx = 0
+
+                    while chunk_idx < len(chunks) and not self._stop_event.is_set():
+                        self._on_status_change(
+                            f"Slide {slide_num} / {total}  —  Speaking… ({chunk_idx+1}/{len(chunks)})"
+                        )
+                        self._tts.speak_async(chunks[chunk_idx])
+                        time.sleep(0.4)          # important: let SAPI start
+
+                        paused = False
+                        while True:
+                            if self._stop_event.is_set():
+                                self._tts.stop()
+                                break
+                            if not self._pause_event.is_set():
+                                self._tts.stop()
+                                paused = True
+                                break
+
+                            if not self._tts.is_speaking():
+                                break
+
+                            time.sleep(0.08)
+
+                        if self._stop_event.is_set():
+                            break
+
+                        if paused:
+                            while not self._pause_event.is_set():
+                                if self._stop_event.is_set():
+                                    break
+                                time.sleep(0.05)
+                            continue
+
+                        chunk_idx += 1
+
                 else:
                     # No notes: brief pause so the slide is visible
                     self._on_status_change(
@@ -338,6 +521,8 @@ class Presenter:
                         if self._stop_event.is_set():
                             break
                         self._pause_event.wait()
+                        if self._stop_event.is_set():
+                            break
                         time.sleep(0.1)
 
             if not self._stop_event.is_set():
@@ -348,7 +533,6 @@ class Presenter:
             # Close COM objects on the same thread they were created on
             self._ppt.close()
             pythoncom.CoUninitialize()
-
 
 # ---------------------------------------------------------------------------
 # GUI
@@ -362,7 +546,16 @@ class AutoPresentApp(tk.Tk):
         self.configure(bg="#1e1e2e")
 
         self._ppt: PPTController | None = None
-        self._tts = TTSEngine()
+        self._tts_sapi = TTSEngine()
+        try:
+            self._tts_piper = PiperTTSEngine()
+            self._has_piper = True
+        except Exception as e:
+            print(f"Piper not available: {e}")
+            self._tts_piper = None
+            self._has_piper = False
+
+        self._tts = self._tts_sapi  # default
         self._presenter: Presenter | None = None
         self._paused = False
 
@@ -446,22 +639,38 @@ class AutoPresentApp(tk.Tk):
                                    width=8)
         self._vol_label.grid(row=1, column=2, padx=(0, 8))
 
+        # Engine selector
+        tk.Label(settings_frame, text="Engine:", bg=BG, fg=FG,
+                 font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
+
+        engine_values = ["SAPI (Windows)"]
+        if getattr(self, "_has_piper", False):
+            engine_values.append("Piper (Neural)")
+
+        self._engine_var = tk.StringVar(value="SAPI (Windows)")
+        self._engine_combo = ttk.Combobox(settings_frame,
+                                          textvariable=self._engine_var,
+                                          values=engine_values,
+                                          state="readonly", width=35)
+        self._engine_combo.grid(row=2, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
+        self._engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
+
         # Voice selector
         tk.Label(settings_frame, text="Voice:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=2, column=0,
+                 font=("Segoe UI", 9)).grid(row=3, column=0,
                                             padx=8, pady=4, sticky="w")
         self._voice_var = tk.StringVar()
         self._voice_combo = ttk.Combobox(settings_frame,
                                          textvariable=self._voice_var,
                                          state="readonly", width=35)
-        self._voice_combo.grid(row=2, column=1, columnspan=2,
+        self._voice_combo.grid(row=3, column=1, columnspan=2,
                                padx=8, pady=4, sticky="ew")
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
         # Start slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=3, column=0,
+                 font=("Segoe UI", 9)).grid(row=4, column=0,
                                             padx=8, pady=4, sticky="w")
         self._start_slide_var = tk.IntVar(value=1)
         self._start_slide_spin = tk.Spinbox(
@@ -471,9 +680,8 @@ class AutoPresentApp(tk.Tk):
             buttonbackground=BTN_BG, relief="flat",
             font=("Segoe UI", 9)
         )
-        self._start_slide_spin.grid(row=3, column=1, padx=8, pady=4,
+        self._start_slide_spin.grid(row=4, column=1, padx=8, pady=4,
                                      sticky="w")
-
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -523,16 +731,6 @@ class AutoPresentApp(tk.Tk):
                                    state="disabled", **btn_cfg)
         self._stop_btn.pack(side="left", padx=4)
 
-    # ---- Voice population -----------------------------------------------
-
-    def _populate_voices(self):
-        voices = self._tts.get_voices_sync()
-        names = [v.name for v in voices]
-        self._voices = voices
-        self._voice_combo["values"] = names
-        if names:
-            self._voice_combo.current(0)
-            self._voice_var.set(names[0])
 
     # ---- Callbacks -------------------------------------------------------
 
@@ -575,6 +773,27 @@ class AutoPresentApp(tk.Tk):
         idx = self._voice_combo.current()
         if idx >= 0 and idx < len(self._voices):
             self._tts.set_voice(self._voices[idx].id)
+
+    def _on_engine_change(self, event=None):
+        engine = self._engine_var.get()
+        if engine.startswith("Piper") and self._has_piper:
+            self._tts = self._tts_piper
+        else:
+            self._tts = self._tts_sapi
+        self._populate_voices()
+
+    def _populate_voices(self):
+        try:
+            voices = self._tts.get_voices_sync()
+            names = [v.name for v in voices]
+            self._voices = voices
+            self._voice_combo["values"] = names
+            if names:
+                self._voice_combo.current(0)
+                self._voice_var.set(names[0])
+                self._tts.set_voice(voices[0].id)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load voices:\n{e}")
 
     def _on_start(self):
         if self._ppt is None:
