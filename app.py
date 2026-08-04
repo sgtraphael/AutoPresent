@@ -454,6 +454,22 @@ class Presenter:
         self._pause_event = threading.Event()
         self._pause_event.set()  # not paused initially
         self.current_slide = 0
+        self._jump_to = None          # target 0-based slide index, or None
+        self._jump_event = threading.Event()
+
+    def next_slide(self):
+        """Request jump to next slide (called from GUI thread)."""
+        self._jump_to = self.current_slide + 1
+        self._jump_event.set()
+        self._tts.stop()
+        self._pause_event.set()   # unblock if paused
+
+    def prev_slide(self):
+        """Request jump to previous slide (called from GUI thread)."""
+        self._jump_to = max(0, self.current_slide - 1)
+        self._jump_event.set()
+        self._tts.stop()
+        self._pause_event.set()
 
     def start(self, from_slide: int = 0):
         self._stop_event.clear()
@@ -478,19 +494,11 @@ class Presenter:
 
 
     def _run(self):
-        """
-        Main presentation loop.
-        All COM calls (open_slideshow / goto_slide / close) happen here so
-        they share the same COM apartment.
-        """
         pythoncom.CoInitialize()
         try:
-            # Init SpVoice TTS on this thread
-            # self._tts._init_engine()
             if hasattr(self._tts, "_init_engine"):
                 self._tts._init_engine()
 
-            # Open the slideshow on this thread
             self._on_status_change("Opening PowerPoint slideshow…")
             try:
                 self._ppt.open_slideshow()
@@ -500,20 +508,25 @@ class Presenter:
                 return
 
             total = self._ppt.slide_count
+            idx = self.current_slide
 
-            for idx in range(self.current_slide, total):
+            while idx < total:
                 if self._stop_event.is_set():
                     break
 
-                # Honour pause before starting the slide
                 self._pause_event.wait()
                 if self._stop_event.is_set():
                     break
 
+                if self._jump_event.is_set():
+                    self._jump_event.clear()
+                    if self._jump_to is not None and 0 <= self._jump_to < total:
+                        idx = self._jump_to
+                    self._jump_to = None
+
                 self.current_slide = idx
                 slide_num = idx + 1
 
-                # Advance PowerPoint to this slide (same thread → works)
                 self._ppt.goto_slide(slide_num)
                 self._on_slide_change(idx)
                 self._on_status_change(f"Slide {slide_num} / {total}")
@@ -525,58 +538,70 @@ class Presenter:
                     chunk_idx = 0
 
                     while chunk_idx < len(chunks) and not self._stop_event.is_set():
+                        if self._jump_event.is_set():
+                            self._tts.stop()
+                            break
+
                         self._on_status_change(
                             f"Slide {slide_num} / {total}  —  Speaking… ({chunk_idx+1}/{len(chunks)})"
                         )
                         self._tts.speak_async(chunks[chunk_idx])
-                        time.sleep(0.4)          # important: let SAPI start
+                        time.sleep(0.4)
 
                         paused = False
                         while True:
                             if self._stop_event.is_set():
                                 self._tts.stop()
                                 break
+                            if self._jump_event.is_set():
+                                self._tts.stop()
+                                break
                             if not self._pause_event.is_set():
                                 self._tts.stop()
                                 paused = True
                                 break
-
                             if not self._tts.is_speaking():
                                 break
-
                             time.sleep(0.08)
 
-                        if self._stop_event.is_set():
+                        if self._stop_event.is_set() or self._jump_event.is_set():
                             break
 
                         if paused:
                             while not self._pause_event.is_set():
-                                if self._stop_event.is_set():
+                                if self._stop_event.is_set() or self._jump_event.is_set():
                                     break
                                 time.sleep(0.05)
+                            if self._stop_event.is_set() or self._jump_event.is_set():
+                                break
                             continue
 
                         chunk_idx += 1
-
                 else:
-                    # No notes: brief pause so the slide is visible
                     self._on_status_change(
                         f"Slide {slide_num} / {total}  —  No notes, waiting 3 s…"
                     )
                     for _ in range(30):
-                        if self._stop_event.is_set():
+                        if self._stop_event.is_set() or self._jump_event.is_set():
                             break
                         self._pause_event.wait()
-                        if self._stop_event.is_set():
+                        if self._stop_event.is_set() or self._jump_event.is_set():
                             break
                         time.sleep(0.1)
+
+                if self._stop_event.is_set():
+                    break
+
+                if self._jump_event.is_set():
+                    continue
+
+                idx += 1
 
             if not self._stop_event.is_set():
                 self._on_status_change("Presentation finished.")
                 self._on_finished()
 
         finally:
-            # Close COM objects on the same thread they were created on
             self._ppt.close()
             pythoncom.CoUninitialize()
 
@@ -777,6 +802,18 @@ class AutoPresentApp(tk.Tk):
                                    state="disabled", **btn_cfg)
         self._stop_btn.pack(side="left", padx=4)
 
+        self._prev_btn = tk.Button(btn_frame, text="⏮  Prev",
+                                   bg=BTN_BG, fg=BTN_FG,
+                                   command=self._on_prev,
+                                   state="disabled", **btn_cfg)
+        self._prev_btn.pack(side="left", padx=4)
+
+        self._next_btn = tk.Button(btn_frame, text="Next  ⏭",
+                                   bg=BTN_BG, fg=BTN_FG,
+                                   command=self._on_next,
+                                   state="disabled", **btn_cfg)
+        self._next_btn.pack(side="left", padx=4)
+
 
     # ---- Callbacks -------------------------------------------------------
 
@@ -866,6 +903,8 @@ class AutoPresentApp(tk.Tk):
         self._start_btn.config(state="disabled")
         self._pause_btn.config(state="normal")
         self._stop_btn.config(state="normal")
+        self._prev_btn.config(state="normal")
+        self._next_btn.config(state="normal")
 
     def _on_pause_resume(self):
         if self._presenter is None:
@@ -887,10 +926,20 @@ class AutoPresentApp(tk.Tk):
         self._reset_controls()
         self._status_var.set("Stopped.")
 
+    def _on_prev(self):
+        if self._presenter and self._presenter.is_running():
+            self._presenter.prev_slide()
+
+    def _on_next(self):
+        if self._presenter and self._presenter.is_running():
+            self._presenter.next_slide()
+
     def _reset_controls(self):
         self._start_btn.config(state="normal" if self._ppt else "disabled")
         self._pause_btn.config(state="disabled", text="⏸  Pause")
         self._stop_btn.config(state="disabled")
+        self._prev_btn.config(state="disabled")
+        self._next_btn.config(state="disabled")
         self._paused = False
 
     # ---- Thread-safe UI callbacks ----------------------------------------
