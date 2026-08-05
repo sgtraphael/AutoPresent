@@ -13,6 +13,18 @@ from pptx import Presentation
 from lxml import etree
 import win32com.client
 import pythoncom
+import re
+
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into sentences. Simple but effective."""
+    if not text or not text.strip():
+        return []
+    
+    # Split on . ! ? followed by space or end of string
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    
+    # Remove empty items
+    return [s.strip() for s in sentences if s.strip()]
 
 # XML namespaces used in PPTX notes slides
 _PPTX_NSMAP = {
@@ -443,12 +455,13 @@ class Presenter:
     """Runs the auto-presentation loop on a background thread."""
 
     def __init__(self, ppt: PPTController, tts: TTSEngine,
-                 on_slide_change, on_status_change, on_finished):
+                 on_slide_change, on_status_change, on_finished,on_subtitle_update=None):
         self._ppt = ppt
         self._tts = tts
         self._on_slide_change = on_slide_change   # callback(slide_index)
         self._on_status_change = on_status_change # callback(message)
         self._on_finished = on_finished           # callback()
+        self._on_subtitle_update = on_subtitle_update
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
@@ -545,6 +558,10 @@ class Presenter:
                         self._on_status_change(
                             f"Slide {slide_num} / {total}  —  Speaking… ({chunk_idx+1}/{len(chunks)})"
                         )
+                        # Update subtitle to the current sentence/chunk
+                        if self._on_subtitle_update:
+                            self._on_subtitle_update(chunks[chunk_idx])
+
                         self._tts.speak_async(chunks[chunk_idx])
                         time.sleep(0.4)
 
@@ -581,6 +598,8 @@ class Presenter:
                     self._on_status_change(
                         f"Slide {slide_num} / {total}  —  No notes, waiting 3 s…"
                     )
+                    if self._on_subtitle_update:
+                            self._on_subtitle_update("(No notes)")
                     for _ in range(30):
                         if self._stop_event.is_set() or self._jump_event.is_set():
                             break
@@ -789,33 +808,37 @@ class AutoPresentApp(tk.Tk):
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
-        # Start slide
+        # Start from slide + Show Subtitles (closer together)
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=4, column=0,
+                font=("Segoe UI", 9)).grid(row=4, column=0,
                                             padx=8, pady=4, sticky="w")
+
+        # Frame to hold spinbox + checkbox side by side
+        start_frame = tk.Frame(settings_frame, bg=BG)
+        start_frame.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="w")
+
         self._start_slide_var = tk.IntVar(value=1)
         self._start_slide_spin = tk.Spinbox(
-            settings_frame, from_=1, to=999,
+            start_frame, from_=1, to=999,
             textvariable=self._start_slide_var,
             width=6, bg=ENTRY_BG, fg=FG,
             buttonbackground=BTN_BG, relief="flat",
             font=("Segoe UI", 9)
         )
-        self._start_slide_spin.grid(row=4, column=1, padx=8, pady=4,
-                                     sticky="w")
-        # --- Show Subtitles checkbox ---
+        self._start_slide_spin.pack(side="left")
+
         tk.Checkbutton(
-            settings_frame,
+            start_frame,
             text="Show Subtitles window",
             variable=self._show_subtitles,
-            bg="#1e1e2e",
-            fg="#cdd6f4",
-            selectcolor="#313244",
-            activebackground="#1e1e2e",
-            activeforeground="#cdd6f4",
+            bg=BG,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=BG,
+            activeforeground=FG,
             font=("Segoe UI", 9),
             command=self._toggle_subtitles
-        ).grid(row=4, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
+        ).pack(side="left", padx=(12, 0))
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -960,6 +983,7 @@ class AutoPresentApp(tk.Tk):
             on_slide_change=self._cb_slide_change,
             on_status_change=self._cb_status,
             on_finished=self._cb_finished,
+            on_subtitle_update=self._cb_subtitle_update,
         )
         self._presenter.start(from_slide=start_idx)
 
@@ -1016,6 +1040,9 @@ class AutoPresentApp(tk.Tk):
     def _cb_finished(self):
         self.after(0, self._on_presentation_finished)
 
+    def _cb_subtitle_update(self, text: str):
+        self.after(0, self._update_subtitles, text)
+
     def _update_slide_ui(self, slide_idx: int):
         self._progress["value"] = slide_idx + 1
         self._show_notes(slide_idx)
@@ -1067,7 +1094,7 @@ class AutoPresentApp(tk.Tk):
     def _on_close(self):
         if self._subtitle_win is not None and self._subtitle_win.winfo_exists():
             self._subtitle_win.destroy()
-            
+
         if self._presenter and self._presenter.is_running():
             if not messagebox.askyesno("Quit",
                                        "Presentation is running. Quit anyway?"):
