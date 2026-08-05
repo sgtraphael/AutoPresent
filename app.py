@@ -608,6 +608,54 @@ class Presenter:
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
+class SubtitleWindow(tk.Toplevel):
+    """subtitle window – appears at the bottom of the screen."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Subtitles")
+        self.configure(bg="#000000")
+        self.attributes("-topmost", True)      # always on top
+        self.attributes("-alpha", 0.88)        # slightly transparent
+        self.resizable(True, True)
+
+        # Get screen size
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        # Window size: wide but short
+        win_width = min(1100, screen_width - 100)
+        win_height = 130
+
+        # Position at bottom center
+        x = (screen_width - win_width) // 2
+        y = screen_height - win_height - 40     # 40px from bottom
+
+        self.geometry(f"{win_width}x{win_height}+{x}+{y}")
+
+        self._label = tk.Label(
+            self,
+            text="(No notes)",
+            font=("Segoe UI", 20),
+            fg="white",
+            bg="#000000",
+            wraplength=win_width - 40,
+            justify="center",
+            anchor="center"
+        )
+        self._label.pack(expand=True, fill="both", padx=15, pady=10)
+
+        # Handle close button – just hide the window
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def update_text(self, text: str):
+        if not text or not text.strip():
+            self._label.config(text="(No notes)")
+        else:
+            self._label.config(text=text.strip())
+
+    def _on_close(self):
+        self.withdraw()
 
 class AutoPresentApp(tk.Tk):
     def __init__(self):
@@ -629,6 +677,8 @@ class AutoPresentApp(tk.Tk):
         self._tts = self._tts_sapi  # default
         self._presenter: Presenter | None = None
         self._paused = False
+        self._subtitle_win: SubtitleWindow | None = None
+        self._show_subtitles = tk.BooleanVar(value=False)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -753,6 +803,19 @@ class AutoPresentApp(tk.Tk):
         )
         self._start_slide_spin.grid(row=4, column=1, padx=8, pady=4,
                                      sticky="w")
+        # --- Show Subtitles checkbox ---
+        tk.Checkbutton(
+            settings_frame,
+            text="Show Subtitles window",
+            variable=self._show_subtitles,
+            bg="#1e1e2e",
+            fg="#cdd6f4",
+            selectcolor="#313244",
+            activebackground="#1e1e2e",
+            activeforeground="#cdd6f4",
+            font=("Segoe UI", 9),
+            command=self._toggle_subtitles
+        ).grid(row=4, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -961,6 +1024,7 @@ class AutoPresentApp(tk.Tk):
         if self._ppt is None:
             return
         notes = self._ppt.get_notes(slide_idx)
+        # Update the main notes box
         self._notes_text.config(state="normal")
         self._notes_text.delete("1.0", "end")
         if notes:
@@ -968,6 +1032,30 @@ class AutoPresentApp(tk.Tk):
         else:
             self._notes_text.insert("end", "(No notes for this slide)")
         self._notes_text.config(state="disabled")
+        # Update subtitle window
+        self._update_subtitles(notes)
+
+    def _toggle_subtitles(self):
+        if self._show_subtitles.get():
+            if self._subtitle_win is None or not self._subtitle_win.winfo_exists():
+                self._subtitle_win = SubtitleWindow(self)
+            else:
+                self._subtitle_win.deiconify()
+                self._subtitle_win.attributes("-topmost", True)
+
+            # Show current notes immediately
+            if self._ppt is not None:
+                current_idx = max(0, self._progress["value"] - 1)
+                notes = self._ppt.get_notes(int(current_idx))
+                self._subtitle_win.update_text(notes)
+        else:
+            if self._subtitle_win is not None and self._subtitle_win.winfo_exists():
+                self._subtitle_win.withdraw()
+
+    def _update_subtitles(self, text: str):
+        if self._subtitle_win is not None and self._subtitle_win.winfo_exists():
+            if self._show_subtitles.get():
+                self._subtitle_win.update_text(text)
 
     def _on_presentation_finished(self):
         self._reset_controls()
@@ -977,6 +1065,9 @@ class AutoPresentApp(tk.Tk):
     # ---- Window close ----------------------------------------------------
 
     def _on_close(self):
+        if self._subtitle_win is not None and self._subtitle_win.winfo_exists():
+            self._subtitle_win.destroy()
+            
         if self._presenter and self._presenter.is_running():
             if not messagebox.askyesno("Quit",
                                        "Presentation is running. Quit anyway?"):
