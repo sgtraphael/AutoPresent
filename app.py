@@ -808,7 +808,7 @@ class AutoPresentApp(tk.Tk):
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
-        # Start from slide + Show Subtitles (closer together)
+        # Start from slide + Show Subtitles
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
                 font=("Segoe UI", 9)).grid(row=4, column=0,
                                             padx=8, pady=4, sticky="w")
@@ -826,7 +826,7 @@ class AutoPresentApp(tk.Tk):
             font=("Segoe UI", 9)
         )
         self._start_slide_spin.pack(side="left")
-
+        #subtitles checkbox
         tk.Checkbutton(
             start_frame,
             text="Show Subtitles window",
