@@ -502,6 +502,14 @@ class Presenter:
         self._stop_event.set()
         self._pause_event.set()   # unblock any wait
         # again, do NOT call tts.stop() from the GUI thread
+
+    def jump_to_slide(self, slide_index: int):
+        """Request a jump to a specific 0-based slide index."""
+        self._jump_to = slide_index
+        self._jump_event.set()
+        self._tts.stop()          # stop current speech immediately
+        self._pause_event.set()   # make sure it’s not stuck in pause
+
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
@@ -808,12 +816,12 @@ class AutoPresentApp(tk.Tk):
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
-        # Start from slide + Show Subtitles
+        # Start from slide + Show Subtitles + Go to slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
                 font=("Segoe UI", 9)).grid(row=4, column=0,
                                             padx=8, pady=4, sticky="w")
 
-        # Frame to hold spinbox + checkbox side by side
+        # Frame to hold the controls side by side
         start_frame = tk.Frame(settings_frame, bg=BG)
         start_frame.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="w")
 
@@ -821,15 +829,15 @@ class AutoPresentApp(tk.Tk):
         self._start_slide_spin = tk.Spinbox(
             start_frame, from_=1, to=999,
             textvariable=self._start_slide_var,
-            width=6, bg=ENTRY_BG, fg=FG,
+            width=5, bg=ENTRY_BG, fg=FG,
             buttonbackground=BTN_BG, relief="flat",
             font=("Segoe UI", 9)
         )
         self._start_slide_spin.pack(side="left")
-        #subtitles checkbox
+
         tk.Checkbutton(
             start_frame,
-            text="Show Subtitles window",
+            text="Show Subtitles",
             variable=self._show_subtitles,
             bg=BG,
             fg=FG,
@@ -838,7 +846,31 @@ class AutoPresentApp(tk.Tk):
             activeforeground=FG,
             font=("Segoe UI", 9),
             command=self._toggle_subtitles
-        ).pack(side="left", padx=(12, 0))
+        ).pack(side="left", padx=(10, 0))
+
+        # Go to slide
+        tk.Label(start_frame, text="Go to:", bg=BG, fg=FG,
+                font=("Segoe UI", 9)).pack(side="left", padx=(15, 4))
+
+        self._goto_var = tk.IntVar(value=1)
+        self._goto_spin = tk.Spinbox(
+            start_frame, from_=1, to=999,
+            textvariable=self._goto_var,
+            width=5, bg=ENTRY_BG, fg=FG,
+            buttonbackground=BTN_BG, relief="flat",
+            font=("Segoe UI", 9)
+        )
+        self._goto_spin.pack(side="left")
+
+        self._jump_btn = tk.Button(
+            start_frame, text="Jump",
+            bg=BTN_BG, fg=BTN_FG,
+            font=("Segoe UI", 9, "bold"),
+            relief="flat", padx=6, pady=0,
+            command=self._on_jump,
+            state="disabled"
+        )
+        self._jump_btn.pack(side="left", padx=(4, 0))
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -992,6 +1024,7 @@ class AutoPresentApp(tk.Tk):
         self._stop_btn.config(state="normal")
         self._prev_btn.config(state="normal")
         self._next_btn.config(state="normal")
+        self._jump_btn.config(state="normal")
 
     def _on_pause_resume(self):
         if self._presenter is None:
@@ -1021,12 +1054,33 @@ class AutoPresentApp(tk.Tk):
         if self._presenter and self._presenter.is_running():
             self._presenter.next_slide()
 
+    def _on_jump(self):
+        if self._presenter is None or not self._presenter.is_running():
+            return
+
+        try:
+            target = self._goto_var.get()
+        except Exception:
+            return
+
+        if self._ppt is None:
+            return
+
+        total = self._ppt.slide_count
+        if target < 1 or target > total:
+            messagebox.showwarning("Invalid slide", f"Please enter a number between 1 and {total}.")
+            return
+
+        # Tell the Presenter to jump
+        self._presenter.jump_to_slide(target - 1)   # convert to 0-based
+
     def _reset_controls(self):
         self._start_btn.config(state="normal" if self._ppt else "disabled")
         self._pause_btn.config(state="disabled", text="⏸  Pause")
         self._stop_btn.config(state="disabled")
         self._prev_btn.config(state="disabled")
         self._next_btn.config(state="disabled")
+        self._jump_btn.config(state="disabled")
         self._paused = False
 
     # ---- Thread-safe UI callbacks ----------------------------------------
