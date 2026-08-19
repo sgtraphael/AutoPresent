@@ -455,7 +455,7 @@ class Presenter:
     """Runs the auto-presentation loop on a background thread."""
 
     def __init__(self, ppt: PPTController, tts: TTSEngine,
-                 on_slide_change, on_status_change, on_finished,on_subtitle_update=None):
+                 on_slide_change, on_status_change, on_finished,on_subtitle_update=None,auto_advance_var=None):
         self._ppt = ppt
         self._tts = tts
         self._on_slide_change = on_slide_change   # callback(slide_index)
@@ -469,6 +469,7 @@ class Presenter:
         self.current_slide = 0
         self._jump_to = None          # target 0-based slide index, or None
         self._jump_event = threading.Event()
+        self._auto_advance_var = auto_advance_var
 
     def next_slide(self):
         """Request jump to next slide (called from GUI thread)."""
@@ -622,7 +623,30 @@ class Presenter:
                 if self._jump_event.is_set():
                     continue
 
-                idx += 1
+                # Auto-advance logic
+                if self._auto_advance_var is None or self._auto_advance_var.get():
+                    idx += 1
+                else:
+                    # Wait until user clicks Next / Jump
+                    self._on_status_change(
+                        f"Slide {slide_num} / {total}  —  Waiting for Next..."
+                    )
+                    if self._on_subtitle_update:
+                        self._on_subtitle_update("(Waiting for Next...)")
+
+                    # Wait until jump/next is triggered or stop
+                    while not self._stop_event.is_set() and not self._jump_event.is_set():
+                        self._pause_event.wait(timeout=0.1)
+
+                    if self._stop_event.is_set():
+                        break
+
+                    # If jump was triggered, the existing jump logic will handle the new index
+                    if self._jump_event.is_set():
+                        continue
+
+                    # Safety fallback
+                    idx += 1
 
             if not self._stop_event.is_set():
                 self._on_status_change("Presentation finished.")
@@ -871,6 +895,23 @@ class AutoPresentApp(tk.Tk):
             state="disabled"
         )
         self._jump_btn.pack(side="left", padx=(4, 0))
+
+        self._jump_btn.pack(side="left", padx=(4, 0))
+
+        # Auto-advance checkbox
+        self._auto_advance = tk.BooleanVar(value=True)  # Default = enabled
+
+        tk.Checkbutton(
+            settings_frame,
+            text="Auto-advance to next slide",
+            variable=self._auto_advance,
+            bg=BG,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=BG,
+            activeforeground=FG,
+            font=("Segoe UI", 9)
+        ).grid(row=5, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -1016,6 +1057,7 @@ class AutoPresentApp(tk.Tk):
             on_status_change=self._cb_status,
             on_finished=self._cb_finished,
             on_subtitle_update=self._cb_subtitle_update,
+            auto_advance_var=self._auto_advance,
         )
         self._presenter.start(from_slide=start_idx)
 
