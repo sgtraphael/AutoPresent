@@ -16,6 +16,7 @@ import pythoncom
 import re
 
 from dotenv import load_dotenv
+from babel import Locale
 
 load_dotenv()  # Loads the .env file
 
@@ -1304,31 +1305,16 @@ class AutoPresentApp(tk.Tk):
         if not hasattr(self, "_all_voices"):
             return
 
-        engine = self._engine_var.get()
-        voices = list(self._all_voices)
+        selected_label = self._language_var.get()
 
-        if engine == "Azure Speech":
-            selected_lang_label = self._language_var.get()
-            reverse_map = {
-                "English": "en",
-                "Chinese": "zh",
-                "Filipino / Tagalog": "fil",
-                "Japanese": "ja",
-                "Korean": "ko",
-                "Spanish": "es",
-                "French": "fr",
-                "German": "de",
-                "Portuguese": "pt",
-                "Italian": "it",
-                "Indonesian": "id",
-                "Vietnamese": "vi",
-                "Thai": "th",
-                "Hindi": "hi",
-                "Arabic": "ar",
-                "Russian": "ru",
-            }
-            code = reverse_map.get(selected_lang_label, selected_lang_label)
-            voices = [v for v in self._all_voices if getattr(v, "language", "") == code]
+        voices = []
+        for v in self._all_voices:
+            code = getattr(v, "language", "en")
+            if self._friendly_lang(code) == selected_label:
+                voices.append(v)
+
+        if not voices:
+            voices = list(self._all_voices)
 
         names = [v.name for v in voices]
         self._voices = voices
@@ -1341,6 +1327,20 @@ class AutoPresentApp(tk.Tk):
         else:
             self._voice_combo.set("")
             self._voice_var.set("")
+            
+    def _friendly_lang(self, code: str) -> str:
+        overrides = {
+            "zh": "Chinese",
+            "fil": "Filipino / Tagalog",
+            "yue": "Cantonese",
+            "en": "English",
+        }
+        if code in overrides:
+            return overrides[code]
+        try:
+            return Locale.parse(code).get_display_name("en")
+        except Exception:
+            return code
 
     def _populate_voices(self):
         try:
@@ -1376,7 +1376,7 @@ class AutoPresentApp(tk.Tk):
                 seen = set()
                 for v in voices:
                     code = getattr(v, "language", "en")
-                    label = lang_map.get(code, code)
+                    label = self._friendly_lang(code)
                     if label not in seen:
                         seen.add(label)
                         languages.append(label)
