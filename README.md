@@ -1,4 +1,3 @@
-```markdown
 # AutoPresent
 
 PowerPoint Auto Presenter with Text-to-Speech.
@@ -113,4 +112,3 @@ If you want offline neural voices:
 - For company use, keep the real Azure key outside the public repository
 - SAPI/Piper are best when instant pause/skip is important
 - Azure is best when natural cloud voice quality is more important
-```
