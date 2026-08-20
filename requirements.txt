@@ -3,3 +3,6 @@ lxml
 pywin32
 piper-tts
 onnxruntime
+azure-cognitiveservices-speech
+python-dotenv
+babel
