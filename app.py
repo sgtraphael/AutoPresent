@@ -420,27 +420,84 @@ class AzureTTSEngine:
         self._voice = "en-US-JennyNeural"
 
     def get_voices_sync(self):
-        voice_names = [
-            # English
-            "en-US-JennyNeural",
-            "en-US-GuyNeural",
-            "en-US-AriaNeural",
-            "en-US-DavisNeural",
-            "en-GB-SoniaNeural",
-            "en-GB-RyanNeural",
+        """
+        Fetch full Azure voice list.
+        Each voice object has:
+        - id
+        - name
+        - locale
+        - language
+        - gender
+        - short_name
+        """
+        from types import SimpleNamespace
 
-            # Chinese
-            "zh-CN-XiaoxiaoNeural",
-            "zh-CN-YunxiNeural",
-            "zh-CN-YunyangNeural",
-            "zh-CN-XiaochenNeural",
-            "zh-CN-XiaoyiNeural",
+        def make_fallback_voices():
+            fallback_names = [
+                # English
+                "en-US-JennyNeural",
+                "en-US-GuyNeural",
+                "en-US-AriaNeural",
+                "en-US-DavisNeural",
+                "en-GB-SoniaNeural",
+                "en-GB-RyanNeural",
 
-            # Filipino / Tagalog
-            "fil-PH-BlessicaNeural",
-            "fil-PH-AngeloNeural",
-        ]
-        return [SimpleNamespace(name=n, id=n) for n in voice_names]
+                # Chinese
+                "zh-CN-XiaoxiaoNeural",
+                "zh-CN-YunxiNeural",
+                "zh-CN-YunyangNeural",
+                "zh-CN-XiaochenNeural",
+                "zh-CN-XiaoyiNeural",
+
+                # Filipino / Tagalog
+                "fil-PH-BlessicaNeural",
+                "fil-PH-AngeloNeural",
+            ]
+
+            voices = []
+            for name in fallback_names:
+                parts = name.split("-")
+                locale = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else "en-US"
+                language = parts[0].lower()
+                voices.append(SimpleNamespace(
+                    id=name,
+                    name=name,
+                    locale=locale,
+                    language=language,
+                    gender="",
+                    short_name=name
+                ))
+            return voices
+
+        try:
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=self._speech_config,
+                audio_config=None
+            )
+            result = synthesizer.get_voices_async().get()
+
+            voices = []
+            if result.reason == speechsdk.ResultReason.VoicesListRetrieved:
+                for v in result.voices:
+                    locale = v.locale or "en-US"
+                    language = locale.split("-")[0].lower()
+                    display = f"{v.local_name} ({v.locale}, {v.gender.name})"
+                    voices.append(SimpleNamespace(
+                        id=v.short_name,
+                        name=display,
+                        locale=locale,
+                        language=language,
+                        gender=v.gender.name,
+                        short_name=v.short_name
+                    ))
+            else:
+                voices = make_fallback_voices()
+
+        except Exception:
+            voices = make_fallback_voices()
+
+        voices.sort(key=lambda x: (x.language, x.name.lower()))
+        return voices
 
     def set_voice(self, voice_name: str):
         self._voice = voice_name
@@ -993,27 +1050,41 @@ class AutoPresentApp(tk.Tk):
         self._engine_combo.grid(row=2, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
         self._engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
 
+        # Language selector
+        tk.Label(settings_frame, text="Language:", bg=BG, fg=FG,
+                font=("Segoe UI", 9)).grid(row=3, column=0, padx=8, pady=4, sticky="w")
+
+        self._language_var = tk.StringVar()
+        self._language_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._language_var,
+            state="disabled",   # enabled later only for Azure
+            width=35
+        )
+        self._language_combo.grid(row=3, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
+        self._language_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
         # Voice selector
         tk.Label(settings_frame, text="Voice:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=3, column=0,
-                                            padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=4, column=0, padx=8, pady=4, sticky="w")
+
         self._voice_var = tk.StringVar()
-        self._voice_combo = ttk.Combobox(settings_frame,
-                                         textvariable=self._voice_var,
-                                         state="readonly", width=35)
-        self._voice_combo.grid(row=3, column=1, columnspan=2,
-                               padx=8, pady=4, sticky="ew")
+        self._voice_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._voice_var,
+            state="readonly",
+            width=35
+        )
+        self._voice_combo.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
         self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
 
         # Start from slide + Show Subtitles + Go to slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
-                font=("Segoe UI", 9)).grid(row=4, column=0,
-                                            padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=5, column=0, padx=8, pady=4, sticky="w")
 
-        # Frame to hold the controls side by side
         start_frame = tk.Frame(settings_frame, bg=BG)
-        start_frame.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="w")
+        start_frame.grid(row=5, column=1, columnspan=2, padx=8, pady=4, sticky="w")
 
         self._start_slide_var = tk.IntVar(value=1)
         self._start_slide_spin = tk.Spinbox(
@@ -1038,7 +1109,6 @@ class AutoPresentApp(tk.Tk):
             command=self._toggle_subtitles
         ).pack(side="left", padx=(10, 0))
 
-        # Go to slide
         tk.Label(start_frame, text="Go to:", bg=BG, fg=FG,
                 font=("Segoe UI", 9)).pack(side="left", padx=(15, 4))
 
@@ -1062,10 +1132,8 @@ class AutoPresentApp(tk.Tk):
         )
         self._jump_btn.pack(side="left", padx=(4, 0))
 
-        self._jump_btn.pack(side="left", padx=(4, 0))
-
         # Auto-advance checkbox
-        self._auto_advance = tk.BooleanVar(value=True)  # Default = enabled
+        self._auto_advance = tk.BooleanVar(value=True)
 
         tk.Checkbutton(
             settings_frame,
@@ -1077,7 +1145,7 @@ class AutoPresentApp(tk.Tk):
             activebackground=BG,
             activeforeground=FG,
             font=("Segoe UI", 9)
-        ).grid(row=5, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
+        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -1204,17 +1272,101 @@ class AutoPresentApp(tk.Tk):
             self._tts = self._tts_sapi
 
         self._populate_voices()
+    def _on_language_change(self, event=None):
+        self._apply_language_filter()
+
+    def _apply_language_filter(self):
+        if not hasattr(self, "_all_voices"):
+            return
+
+        engine = self._engine_var.get()
+        voices = list(self._all_voices)
+
+        if engine == "Azure Speech":
+            selected_lang_label = self._language_var.get()
+            reverse_map = {
+                "English": "en",
+                "Chinese": "zh",
+                "Filipino / Tagalog": "fil",
+                "Japanese": "ja",
+                "Korean": "ko",
+                "Spanish": "es",
+                "French": "fr",
+                "German": "de",
+                "Portuguese": "pt",
+                "Italian": "it",
+                "Indonesian": "id",
+                "Vietnamese": "vi",
+                "Thai": "th",
+                "Hindi": "hi",
+                "Arabic": "ar",
+                "Russian": "ru",
+            }
+            code = reverse_map.get(selected_lang_label, selected_lang_label)
+            voices = [v for v in self._all_voices if getattr(v, "language", "") == code]
+
+        names = [v.name for v in voices]
+        self._voices = voices
+        self._voice_combo["values"] = names
+
+        if names:
+            self._voice_combo.current(0)
+            self._voice_var.set(names[0])
+            self._tts.set_voice(voices[0].id)
+        else:
+            self._voice_combo.set("")
+            self._voice_var.set("")
 
     def _populate_voices(self):
         try:
             voices = self._tts.get_voices_sync()
-            names = [v.name for v in voices]
-            self._voices = voices
-            self._voice_combo["values"] = names
-            if names:
-                self._voice_combo.current(0)
-                self._voice_var.set(names[0])
-                self._tts.set_voice(voices[0].id)
+            self._all_voices = voices
+
+            lang_map = {
+                "en": "English",
+                "zh": "Chinese",
+                "fil": "Filipino / Tagalog",
+                "ja": "Japanese",
+                "ko": "Korean",
+                "es": "Spanish",
+                "fr": "French",
+                "de": "German",
+                "pt": "Portuguese",
+                "it": "Italian",
+                "id": "Indonesian",
+                "vi": "Vietnamese",
+                "th": "Thai",
+                "hi": "Hindi",
+                "ar": "Arabic",
+                "ru": "Russian",
+            }
+
+            languages = []
+            seen = set()
+            for v in voices:
+                code = getattr(v, "language", "en")
+                label = lang_map.get(code, code)
+                if label not in seen:
+                    seen.add(label)
+                    languages.append(label)
+
+            languages = sorted(languages)
+
+            engine = self._engine_var.get()
+            if engine == "Azure Speech":
+                self._language_combo.configure(state="readonly")
+                self._language_combo["values"] = languages
+                if languages:
+                    preferred = ["English", "Chinese", "Filipino / Tagalog"]
+                    chosen = next((p for p in preferred if p in languages), languages[0])
+                    self._language_var.set(chosen)
+            else:
+                self._language_combo.configure(state="disabled")
+                self._language_combo["values"] = []
+                self._language_var.set("")
+
+            self._apply_language_filter()
+
         except Exception as e:
             messagebox.showerror("Error", f"Could not load voices:\n{e}")
 
