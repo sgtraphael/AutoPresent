@@ -38,21 +38,48 @@ _PPTX_NSMAP = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
-def split_into_chunks(text: str, max_words: int = 12) -> list[str]:
-    """Split text into reasonably sized speaking chunks."""
-    import re
-    # Split on sentence endings first
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+import re
+
+def split_into_chunks(text: str, max_len: int = 40) -> list[str]:
+    """
+    Split notes into shorter chunks for more responsive pause/stop.
+    Works better for Chinese by splitting on commas too.
+    """
+    if not text or not text.strip():
+        return []
+
+    text = text.strip()
+
+    # First split by strong punctuation (English + Chinese)
+    parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
+
     chunks = []
-    for sent in sentences:
-        words = sent.split()
-        if not words:
+    for part in parts:
+        part = part.strip()
+        if not part:
             continue
-        for i in range(0, len(words), max_words):
-            chunk = " ".join(words[i:i + max_words])
-            if chunk:
-                chunks.append(chunk)
-    return chunks
+
+        # For longer parts, split further by weak punctuation
+        if len(part) > max_len:
+            small_parts = re.split(r'(?<=[，、,])\s*', part)
+            current = ""
+            for sp in small_parts:
+                sp = sp.strip()
+                if not sp:
+                    continue
+                if len(current) + len(sp) <= max_len:
+                    current = (current + sp).strip()
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = sp
+            if current:
+                chunks.append(current)
+        else:
+            chunks.append(part)
+
+    # Final cleanup
+    return [c.strip() for c in chunks if c.strip()]
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -353,21 +380,44 @@ class PiperTTSEngine:
 import azure.cognitiveservices.speech as speechsdk
 import threading
 from types import SimpleNamespace
+
 class AzureTTSEngine:
     def __init__(self, key: str, region: str):
         self.key = key
         self.region = region
-        self._speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
-        self._synthesizer = None
         self._lock = threading.Lock()
         self._is_speaking = False
+        self._synthesizer = None
+
+        self._speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
 
         # Default settings
         self._rate = "+0%"
         self._volume = "+0%"
         self._voice = "en-US-JennyNeural"
-        
-    from types import SimpleNamespace
+
+import azure.cognitiveservices.speech as speechsdk
+import threading
+from types import SimpleNamespace
+
+class AzureTTSEngine:
+    def __init__(self, key: str, region: str):
+        self.key = key
+        self.region = region
+        self._lock = threading.Lock()
+        self._is_speaking = False
+        self._stop_requested = False
+        self._synthesizer = None
+
+        self._speech_config = speechsdk.SpeechConfig(
+            subscription=key,
+            region=region
+        )
+
+        # Defaults
+        self._rate = "+0%"
+        self._volume = "+0%"
+        self._voice = "en-US-JennyNeural"
 
     def get_voices_sync(self):
         voice_names = [
@@ -389,69 +439,72 @@ class AzureTTSEngine:
             # Filipino / Tagalog
             "fil-PH-BlessicaNeural",
             "fil-PH-AngeloNeural",
-
-            # Others
-            "ja-JP-NanamiNeural",
-            "ko-KR-SunHiNeural",
-            "es-ES-ElviraNeural",
-            "fr-FR-DeniseNeural",
         ]
+        return [SimpleNamespace(name=n, id=n) for n in voice_names]
 
-        voices = []
-        for name in voice_names:
-            voice = SimpleNamespace()
-            voice.name = name
-            voice.id = name
-            voices.append(voice)
-
-        return voices
-    
     def set_voice(self, voice_name: str):
         self._voice = voice_name
+        self._speech_config.speech_synthesis_voice_name = voice_name
 
     def set_rate(self, rate_wpm: int):
-        # Convert approximate wpm to SSML rate
-        # 175 wpm ≈ +0%
+        # 175 wpm as baseline
         percent = int((rate_wpm - 175) / 1.75)
         percent = max(-50, min(100, percent))
         self._rate = f"{percent:+d}%"
 
     def set_volume(self, volume: float):
-        # volume 0.0 ~ 1.0 → SSML
-        percent = int((volume - 1.0) * 100)
-        self._volume = f"{percent:+d}%"
+        # volume expected in range 0.0 ~ 1.0
+        percent = int(volume * 100)
+        percent = max(0, min(100, percent))
+        self._volume = f"{percent}%"
 
     def _build_ssml(self, text: str) -> str:
-        return f"""
-        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>
+        return f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>
             <voice name='{self._voice}'>
                 <prosody rate='{self._rate}' volume='{self._volume}'>
                     {text}
                 </prosody>
             </voice>
-        </speak>
-        """
+        </speak>"""
 
     def speak_async(self, text: str):
         def _speak():
             with self._lock:
+                if self._stop_requested:
+                    self._is_speaking = False
+                    return
+
                 self._is_speaking = True
                 self._speech_config.speech_synthesis_voice_name = self._voice
-                synthesizer = speechsdk.SpeechSynthesizer(speech_config=self._speech_config)
-                ssml = self._build_ssml(text)
-                result = synthesizer.speak_ssml_async(ssml).get()
-                self._is_speaking = False
 
+                self._synthesizer = speechsdk.SpeechSynthesizer(
+                    speech_config=self._speech_config
+                )
+
+                ssml = self._build_ssml(text)
+
+                try:
+                    result = self._synthesizer.speak_ssml_async(ssml).get()
+                except Exception:
+                    pass
+                finally:
+                    self._is_speaking = False
+
+        self._stop_requested = False
         threading.Thread(target=_speak, daemon=True).start()
 
     def stop(self):
-        # Azure doesn't have a perfect instant stop on the simple synthesizer.
-        # For now we just mark as not speaking.
-        self._is_speaking = False
+        with self._lock:
+            self._stop_requested = True
+            self._is_speaking = False
+            if self._synthesizer is not None:
+                try:
+                    self._synthesizer.stop_speaking_async()
+                except Exception:
+                    pass
 
     def is_speaking(self) -> bool:
         return self._is_speaking
-
 # ---------------------------------------------------------------------------
 # PowerPoint controller
 # ---------------------------------------------------------------------------
