@@ -8,12 +8,28 @@ from tkinter import filedialog, ttk, messagebox
 import threading
 import time
 import os
+import sys
 
 from pptx import Presentation
 from lxml import etree
 import win32com.client
 import pythoncom
 import re
+
+from dotenv import load_dotenv
+from babel import Locale
+
+def app_dir() -> str:
+    # When frozen by PyInstaller, use the exe folder
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # When running from source
+    return os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(app_dir(), ".env"))
+
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
 def split_into_sentences(text: str) -> list[str]:
     """Split text into sentences. Simple but effective."""
@@ -31,21 +47,57 @@ _PPTX_NSMAP = {
     'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
-def split_into_chunks(text: str, max_words: int = 12) -> list[str]:
-    """Split text into reasonably sized speaking chunks."""
-    import re
-    # Split on sentence endings first
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+import re
+def split_into_chunks(text: str, max_len: int = 40) -> list[str]:
+    """
+    Split notes into chunks.
+    - Chinese: shorter chunks for better pause/stop responsiveness
+    - English/others: mainly sentence-level chunks
+    """
+    if not text or not text.strip():
+        return []
+
+    text = text.strip()
+
+    def is_chinese_text(s: str) -> bool:
+        # If enough CJK characters, treat as Chinese
+        cjk = re.findall(r"[\u4e00-\u9fff]", s)
+        return len(cjk) >= max(1, len(s) // 4)
+
+    # Strong sentence punctuation
+    parts = re.split(r"(?<=[。！？；.!?;])\s*", text)
+
     chunks = []
-    for sent in sentences:
-        words = sent.split()
-        if not words:
+    for part in parts:
+        part = part.strip()
+        if not part:
             continue
-        for i in range(0, len(words), max_words):
-            chunk = " ".join(words[i:i + max_words])
-            if chunk:
-                chunks.append(chunk)
-    return chunks
+
+        # Only Chinese gets extra short splitting
+        if is_chinese_text(part) and len(part) > max_len:
+            small_parts = re.split(r"(?<=[，、,])\s*", part)
+
+            current = ""
+            for sp in small_parts:
+                sp = sp.strip()
+                if not sp:
+                    continue
+
+                # Chinese chars are denser; keep chunks shorter
+                if len(current) + len(sp) <= max_len:
+                    current = (current + sp).strip()
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = sp
+
+            if current:
+                chunks.append(current)
+        else:
+            # English / other languages: keep sentence-level chunk
+            chunks.append(part)
+
+    return [c.strip() for c in chunks if c.strip()]
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -342,6 +394,192 @@ class PiperTTSEngine:
         self._stop_flag = True
         self._is_playing = False
         winsound.PlaySound(None, winsound.SND_PURGE)
+
+import azure.cognitiveservices.speech as speechsdk
+import threading
+from types import SimpleNamespace
+
+class AzureTTSEngine:
+    def __init__(self, key: str, region: str):
+        self.key = key
+        self.region = region
+        self._lock = threading.Lock()
+        self._is_speaking = False
+        self._synthesizer = None
+
+        self._speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
+
+        # Default settings
+        self._rate = "+0%"
+        self._volume = "+0%"
+        self._voice = "en-US-JennyNeural"
+
+import azure.cognitiveservices.speech as speechsdk
+import threading
+from types import SimpleNamespace
+
+class AzureTTSEngine:
+    def __init__(self, key: str, region: str):
+        self.key = key
+        self.region = region
+        self._lock = threading.Lock()
+        self._is_speaking = False
+        self._stop_requested = False
+        self._synthesizer = None
+
+        self._speech_config = speechsdk.SpeechConfig(
+            subscription=key,
+            region=region
+        )
+
+        # Defaults
+        self._rate = "+0%"
+        self._volume = "+0%"
+        self._voice = "en-US-JennyNeural"
+
+    def get_voices_sync(self):
+        """
+        Fetch full Azure voice list.
+        Each voice object has:
+        - id
+        - name
+        - locale
+        - language
+        - gender
+        - short_name
+        """
+        from types import SimpleNamespace
+
+        def make_fallback_voices():
+            fallback_names = [
+                # English
+                "en-US-JennyNeural",
+                "en-US-GuyNeural",
+                "en-US-AriaNeural",
+                "en-US-DavisNeural",
+                "en-GB-SoniaNeural",
+                "en-GB-RyanNeural",
+
+                # Chinese
+                "zh-CN-XiaoxiaoNeural",
+                "zh-CN-YunxiNeural",
+                "zh-CN-YunyangNeural",
+                "zh-CN-XiaochenNeural",
+                "zh-CN-XiaoyiNeural",
+
+                # Filipino / Tagalog
+                "fil-PH-BlessicaNeural",
+                "fil-PH-AngeloNeural",
+            ]
+
+            voices = []
+            for name in fallback_names:
+                parts = name.split("-")
+                locale = f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else "en-US"
+                language = parts[0].lower()
+                voices.append(SimpleNamespace(
+                    id=name,
+                    name=name,
+                    locale=locale,
+                    language=language,
+                    gender="",
+                    short_name=name
+                ))
+            return voices
+
+        try:
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=self._speech_config,
+                audio_config=None
+            )
+            result = synthesizer.get_voices_async().get()
+
+            voices = []
+            if result.reason == speechsdk.ResultReason.VoicesListRetrieved:
+                for v in result.voices:
+                    locale = v.locale or "en-US"
+                    language = locale.split("-")[0].lower()
+                    display = f"{v.local_name} ({v.locale}, {v.gender.name})"
+                    voices.append(SimpleNamespace(
+                        id=v.short_name,
+                        name=display,
+                        locale=locale,
+                        language=language,
+                        gender=v.gender.name,
+                        short_name=v.short_name
+                    ))
+            else:
+                voices = make_fallback_voices()
+
+        except Exception:
+            voices = make_fallback_voices()
+
+        voices.sort(key=lambda x: (x.language, x.name.lower()))
+        return voices
+
+    def set_voice(self, voice_name: str):
+        self._voice = voice_name
+        self._speech_config.speech_synthesis_voice_name = voice_name
+
+    def set_rate(self, rate_wpm: int):
+        # 175 wpm as baseline
+        percent = int((rate_wpm - 175) / 1.75)
+        percent = max(-50, min(100, percent))
+        self._rate = f"{percent:+d}%"
+
+    def set_volume(self, volume: float):
+        # volume expected in range 0.0 ~ 1.0
+        percent = int(volume * 100)
+        percent = max(0, min(100, percent))
+        self._volume = f"{percent}%"
+
+    def _build_ssml(self, text: str) -> str:
+        return f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>
+            <voice name='{self._voice}'>
+                <prosody rate='{self._rate}' volume='{self._volume}'>
+                    {text}
+                </prosody>
+            </voice>
+        </speak>"""
+
+    def speak_async(self, text: str):
+        def _speak():
+            with self._lock:
+                if self._stop_requested:
+                    self._is_speaking = False
+                    return
+
+                self._is_speaking = True
+                self._speech_config.speech_synthesis_voice_name = self._voice
+
+                self._synthesizer = speechsdk.SpeechSynthesizer(
+                    speech_config=self._speech_config
+                )
+
+                ssml = self._build_ssml(text)
+
+                try:
+                    result = self._synthesizer.speak_ssml_async(ssml).get()
+                except Exception:
+                    pass
+                finally:
+                    self._is_speaking = False
+
+        self._stop_requested = False
+        threading.Thread(target=_speak, daemon=True).start()
+
+    def stop(self):
+        with self._lock:
+            self._stop_requested = True
+            self._is_speaking = False
+            if self._synthesizer is not None:
+                try:
+                    self._synthesizer.stop_speaking_async()
+                except Exception:
+                    pass
+
+    def is_speaking(self) -> bool:
+        return self._is_speaking
 # ---------------------------------------------------------------------------
 # PowerPoint controller
 # ---------------------------------------------------------------------------
@@ -813,41 +1051,69 @@ class AutoPresentApp(tk.Tk):
 
         # Engine selector
         tk.Label(settings_frame, text="Engine:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
 
         engine_values = ["SAPI (Windows)"]
         if getattr(self, "_has_piper", False):
             engine_values.append("Piper (Neural)")
 
-        self._engine_var = tk.StringVar(value="SAPI (Windows)")
-        self._engine_combo = ttk.Combobox(settings_frame,
-                                          textvariable=self._engine_var,
-                                          values=engine_values,
-                                          state="readonly", width=35)
+        # Add Azure Speech
+        engine_values.append("Azure Speech")
+
+        # Prefer Azure as default if key exists, otherwise SAPI
+        default_engine = "Azure Speech" if (AZURE_SPEECH_KEY and AZURE_SPEECH_REGION) else "SAPI (Windows)"
+        self._engine_var = tk.StringVar(value=default_engine)
+
+        self._engine_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._engine_var,
+            values=engine_values,
+            state="readonly",
+            width=35
+        )
         self._engine_combo.grid(row=2, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
         self._engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
 
+        # Language selector
+        self._language_label = tk.Label(
+            settings_frame, text="Language:", bg=BG, fg=FG,
+            font=("Segoe UI", 9)
+        )
+        self._language_label.grid(row=3, column=0, padx=8, pady=4, sticky="w")
+
+        self._language_var = tk.StringVar()
+        self._language_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._language_var,
+            state="disabled",   # enabled later only for Azure
+            width=35
+        )
+        self._language_combo.grid(row=3, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
+        self._language_combo.bind("<<ComboboxSelected>>", self._on_language_change)
+
         # Voice selector
         tk.Label(settings_frame, text="Voice:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=3, column=0,
-                                            padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=4, column=0, padx=8, pady=4, sticky="w")
+
         self._voice_var = tk.StringVar()
-        self._voice_combo = ttk.Combobox(settings_frame,
-                                         textvariable=self._voice_var,
-                                         state="readonly", width=35)
-        self._voice_combo.grid(row=3, column=1, columnspan=2,
-                               padx=8, pady=4, sticky="ew")
-        self._populate_voices()
+        self._voice_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._voice_var,
+            state="readonly",
+            width=35
+        )
+        self._voice_combo.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
+
+        # Apply default engine after Language/Voice widgets exist
+        self._on_engine_change()
 
         # Start from slide + Show Subtitles + Go to slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
-                font=("Segoe UI", 9)).grid(row=4, column=0,
-                                            padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=5, column=0, padx=8, pady=4, sticky="w")
 
-        # Frame to hold the controls side by side
         start_frame = tk.Frame(settings_frame, bg=BG)
-        start_frame.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="w")
+        start_frame.grid(row=5, column=1, columnspan=2, padx=8, pady=4, sticky="w")
 
         self._start_slide_var = tk.IntVar(value=1)
         self._start_slide_spin = tk.Spinbox(
@@ -872,7 +1138,6 @@ class AutoPresentApp(tk.Tk):
             command=self._toggle_subtitles
         ).pack(side="left", padx=(10, 0))
 
-        # Go to slide
         tk.Label(start_frame, text="Go to:", bg=BG, fg=FG,
                 font=("Segoe UI", 9)).pack(side="left", padx=(15, 4))
 
@@ -896,10 +1161,8 @@ class AutoPresentApp(tk.Tk):
         )
         self._jump_btn.pack(side="left", padx=(4, 0))
 
-        self._jump_btn.pack(side="left", padx=(4, 0))
-
         # Auto-advance checkbox
-        self._auto_advance = tk.BooleanVar(value=True)  # Default = enabled
+        self._auto_advance = tk.BooleanVar(value=True)
 
         tk.Checkbutton(
             settings_frame,
@@ -911,7 +1174,7 @@ class AutoPresentApp(tk.Tk):
             activebackground=BG,
             activeforeground=FG,
             font=("Segoe UI", 9)
-        ).grid(row=5, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
+        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -1018,22 +1281,180 @@ class AutoPresentApp(tk.Tk):
 
     def _on_engine_change(self, event=None):
         engine = self._engine_var.get()
+
         if engine.startswith("Piper") and self._has_piper:
             self._tts = self._tts_piper
+            self._hide_language_filter()
+
+        elif engine == "Azure Speech":
+            if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+                self._tts = AzureTTSEngine(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+                self._show_language_filter()
+            else:
+                messagebox.showerror(
+                    "Azure Error",
+                    "Azure Speech Key or Region not found in .env file."
+                )
+                self._engine_var.set("SAPI (Windows)")
+                self._tts = self._tts_sapi
+                self._hide_language_filter()
+
         else:
             self._tts = self._tts_sapi
+            self._hide_language_filter()
+
         self._populate_voices()
+
+    def _show_language_filter(self):
+        self._language_label.grid()
+        self._language_combo.grid()
+        self._language_combo.configure(state="readonly")
+
+    def _hide_language_filter(self):
+        self._language_label.grid_remove()
+        self._language_combo.grid_remove()
+        self._language_var.set("")
+
+    def _on_language_change(self, event=None):
+        self._apply_language_filter()
+
+    def _apply_language_filter(self):
+        if not hasattr(self, "_all_voices"):
+            return
+
+        selected_label = self._language_var.get()
+
+        voices = []
+        for v in self._all_voices:
+            code = getattr(v, "language", "en")
+            if self._friendly_lang(code) == selected_label:
+                voices.append(v)
+
+        if not voices:
+            voices = list(self._all_voices)
+
+        names = [v.name for v in voices]
+        self._voices = voices
+        self._voice_combo["values"] = names
+
+        if not names:
+            self._voice_combo.set("")
+            self._voice_var.set("")
+            return
+
+        preferred_ids = [
+            "en-US-JennyNeural",
+            "en-US-AriaNeural",
+            "en-US-GuyNeural",
+        ]
+
+        # Map voice id -> index
+        id_to_index = {
+            getattr(v, "id", ""): i
+            for i, v in enumerate(voices)
+        }
+
+        chosen_index = 0
+        for pref in preferred_ids:
+            if pref in id_to_index:
+                chosen_index = id_to_index[pref]
+                break
+        else:
+            # fallback: name contains Jenny
+            for i, v in enumerate(voices):
+                if "Jenny" in getattr(v, "name", ""):
+                    chosen_index = i
+                    break
+
+        self._voice_combo.current(chosen_index)
+        self._voice_var.set(names[chosen_index])
+        self._tts.set_voice(voices[chosen_index].id)
+            
+    def _friendly_lang(self, code: str) -> str:
+        overrides = {
+            "zh": "Chinese",
+            "fil": "Filipino / Tagalog",
+            "yue": "Cantonese",
+            "en": "English",
+        }
+        if code in overrides:
+            return overrides[code]
+        try:
+            return Locale.parse(code).get_display_name("en")
+        except Exception:
+            return code
 
     def _populate_voices(self):
         try:
             voices = self._tts.get_voices_sync()
-            names = [v.name for v in voices]
-            self._voices = voices
-            self._voice_combo["values"] = names
-            if names:
-                self._voice_combo.current(0)
-                self._voice_var.set(names[0])
-                self._tts.set_voice(voices[0].id)
+            self._all_voices = voices
+            # Temporary debug
+            print("Voice count:", len(voices))
+            print("Sample:", [getattr(v, "id", v.name) for v in voices[:10]])
+
+            engine = self._engine_var.get()
+
+            if engine == "Azure Speech":
+                lang_map = {
+                    "en": "English",
+                    "zh": "Chinese",
+                    "fil": "Filipino / Tagalog",
+                    "ja": "Japanese",
+                    "ko": "Korean",
+                    "es": "Spanish",
+                    "fr": "French",
+                    "de": "German",
+                    "pt": "Portuguese",
+                    "it": "Italian",
+                    "id": "Indonesian",
+                    "vi": "Vietnamese",
+                    "th": "Thai",
+                    "hi": "Hindi",
+                    "ar": "Arabic",
+                    "ru": "Russian",
+                }
+
+                languages = []
+                seen = set()
+                for v in voices:
+                    code = getattr(v, "language", "en")
+                    label = self._friendly_lang(code)
+                    if label not in seen:
+                        seen.add(label)
+                        languages.append(label)
+
+                languages = sorted(languages)
+
+                self._show_language_filter()
+                self._language_combo["values"] = languages
+
+                if languages:
+                    preferred = ["English", "Chinese", "Filipino / Tagalog"]
+                    current = self._language_var.get()
+                    if current in languages:
+                        chosen = current
+                    else:
+                        chosen = next((p for p in preferred if p in languages), languages[0])
+                    self._language_var.set(chosen)
+
+                self._apply_language_filter()
+
+            else:
+                # SAPI / Piper: hide language filter, show flat voice list
+                self._hide_language_filter()
+
+                names = [v.name for v in voices]
+                self._voices = voices
+                self._voice_combo["values"] = names
+
+                if names:
+                    self._voice_combo.current(0)
+                    self._voice_var.set(names[0])
+                    self._tts.set_voice(voices[0].id)
+                else:
+                    self._voice_combo.set("")
+                    self._voice_var.set("")
+
         except Exception as e:
             messagebox.showerror("Error", f"Could not load voices:\n{e}")
 
