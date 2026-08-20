@@ -15,6 +15,13 @@ import win32com.client
 import pythoncom
 import re
 
+from dotenv import load_dotenv
+
+load_dotenv()  # Loads the .env file
+
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
+
 def split_into_sentences(text: str) -> list[str]:
     """Split text into sentences. Simple but effective."""
     if not text or not text.strip():
@@ -342,6 +349,109 @@ class PiperTTSEngine:
         self._stop_flag = True
         self._is_playing = False
         winsound.PlaySound(None, winsound.SND_PURGE)
+
+import azure.cognitiveservices.speech as speechsdk
+import threading
+from types import SimpleNamespace
+class AzureTTSEngine:
+    def __init__(self, key: str, region: str):
+        self.key = key
+        self.region = region
+        self._speech_config = speechsdk.SpeechConfig(subscription=key, region=region)
+        self._synthesizer = None
+        self._lock = threading.Lock()
+        self._is_speaking = False
+
+        # Default settings
+        self._rate = "+0%"
+        self._volume = "+0%"
+        self._voice = "en-US-JennyNeural"
+        
+    from types import SimpleNamespace
+
+    def get_voices_sync(self):
+        voice_names = [
+            # English
+            "en-US-JennyNeural",
+            "en-US-GuyNeural",
+            "en-US-AriaNeural",
+            "en-US-DavisNeural",
+            "en-GB-SoniaNeural",
+            "en-GB-RyanNeural",
+
+            # Chinese
+            "zh-CN-XiaoxiaoNeural",
+            "zh-CN-YunxiNeural",
+            "zh-CN-YunyangNeural",
+            "zh-CN-XiaochenNeural",
+            "zh-CN-XiaoyiNeural",
+
+            # Filipino / Tagalog
+            "fil-PH-BlessicaNeural",
+            "fil-PH-AngeloNeural",
+
+            # Others
+            "ja-JP-NanamiNeural",
+            "ko-KR-SunHiNeural",
+            "es-ES-ElviraNeural",
+            "fr-FR-DeniseNeural",
+        ]
+
+        voices = []
+        for name in voice_names:
+            voice = SimpleNamespace()
+            voice.name = name
+            voice.id = name
+            voices.append(voice)
+
+        return voices
+    
+    def set_voice(self, voice_name: str):
+        self._voice = voice_name
+
+    def set_rate(self, rate_wpm: int):
+        # Convert approximate wpm to SSML rate
+        # 175 wpm ≈ +0%
+        percent = int((rate_wpm - 175) / 1.75)
+        percent = max(-50, min(100, percent))
+        self._rate = f"{percent:+d}%"
+
+    def set_volume(self, volume: float):
+        # volume 0.0 ~ 1.0 → SSML
+        percent = int((volume - 1.0) * 100)
+        self._volume = f"{percent:+d}%"
+
+    def _build_ssml(self, text: str) -> str:
+        return f"""
+        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>
+            <voice name='{self._voice}'>
+                <prosody rate='{self._rate}' volume='{self._volume}'>
+                    {text}
+                </prosody>
+            </voice>
+        </speak>
+        """
+
+    def speak_async(self, text: str):
+        def _speak():
+            with self._lock:
+                self._is_speaking = True
+                self._speech_config.speech_synthesis_voice_name = self._voice
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=self._speech_config)
+                ssml = self._build_ssml(text)
+                result = synthesizer.speak_ssml_async(ssml).get()
+                self._is_speaking = False
+
+        threading.Thread(target=_speak, daemon=True).start()
+
+    def stop(self):
+        # Azure doesn't have a perfect instant stop on the simple synthesizer.
+        # For now we just mark as not speaking.
+        self._is_speaking = False
+
+    def is_speaking(self) -> bool:
+        return self._is_speaking
+
 # ---------------------------------------------------------------------------
 # PowerPoint controller
 # ---------------------------------------------------------------------------
@@ -819,6 +929,9 @@ class AutoPresentApp(tk.Tk):
         if getattr(self, "_has_piper", False):
             engine_values.append("Piper (Neural)")
 
+        # Add Azure Speech
+        engine_values.append("Azure Speech")
+
         self._engine_var = tk.StringVar(value="SAPI (Windows)")
         self._engine_combo = ttk.Combobox(settings_frame,
                                           textvariable=self._engine_var,
@@ -1018,10 +1131,25 @@ class AutoPresentApp(tk.Tk):
 
     def _on_engine_change(self, event=None):
         engine = self._engine_var.get()
+
         if engine.startswith("Piper") and self._has_piper:
             self._tts = self._tts_piper
+
+        elif engine == "Azure Speech":
+            if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+                self._tts = AzureTTSEngine(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+            else:
+                messagebox.showerror(
+                    "Azure Error",
+                    "Azure Speech Key or Region not found in .env file."
+                )
+                self._engine_var.set("SAPI (Windows)")
+                self._tts = self._tts_sapi
+
         else:
+            # Default to SAPI
             self._tts = self._tts_sapi
+
         self._populate_voices()
 
     def _populate_voices(self):
