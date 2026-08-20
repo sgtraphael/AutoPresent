@@ -1033,7 +1033,7 @@ class AutoPresentApp(tk.Tk):
 
         # Engine selector
         tk.Label(settings_frame, text="Engine:", bg=BG, fg=FG,
-                 font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
+                font=("Segoe UI", 9)).grid(row=2, column=0, padx=8, pady=4, sticky="w")
 
         engine_values = ["SAPI (Windows)"]
         if getattr(self, "_has_piper", False):
@@ -1042,17 +1042,26 @@ class AutoPresentApp(tk.Tk):
         # Add Azure Speech
         engine_values.append("Azure Speech")
 
-        self._engine_var = tk.StringVar(value="SAPI (Windows)")
-        self._engine_combo = ttk.Combobox(settings_frame,
-                                          textvariable=self._engine_var,
-                                          values=engine_values,
-                                          state="readonly", width=35)
+        # Prefer Azure as default if key exists, otherwise SAPI
+        default_engine = "Azure Speech" if (AZURE_SPEECH_KEY and AZURE_SPEECH_REGION) else "SAPI (Windows)"
+        self._engine_var = tk.StringVar(value=default_engine)
+
+        self._engine_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self._engine_var,
+            values=engine_values,
+            state="readonly",
+            width=35
+        )
         self._engine_combo.grid(row=2, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
         self._engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
 
         # Language selector
-        tk.Label(settings_frame, text="Language:", bg=BG, fg=FG,
-                font=("Segoe UI", 9)).grid(row=3, column=0, padx=8, pady=4, sticky="w")
+        self._language_label = tk.Label(
+            settings_frame, text="Language:", bg=BG, fg=FG,
+            font=("Segoe UI", 9)
+        )
+        self._language_label.grid(row=3, column=0, padx=8, pady=4, sticky="w")
 
         self._language_var = tk.StringVar()
         self._language_combo = ttk.Combobox(
@@ -1076,8 +1085,10 @@ class AutoPresentApp(tk.Tk):
             width=35
         )
         self._voice_combo.grid(row=4, column=1, columnspan=2, padx=8, pady=4, sticky="ew")
-        self._populate_voices()
         self._voice_combo.bind("<<ComboboxSelected>>", self._on_voice_change)
+
+        # Apply default engine after Language/Voice widgets exist
+        self._on_engine_change()
 
         # Start from slide + Show Subtitles + Go to slide
         tk.Label(settings_frame, text="Start from slide:", bg=BG, fg=FG,
@@ -1255,10 +1266,12 @@ class AutoPresentApp(tk.Tk):
 
         if engine.startswith("Piper") and self._has_piper:
             self._tts = self._tts_piper
+            self._hide_language_filter()
 
         elif engine == "Azure Speech":
             if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
                 self._tts = AzureTTSEngine(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+                self._show_language_filter()
             else:
                 messagebox.showerror(
                     "Azure Error",
@@ -1266,12 +1279,24 @@ class AutoPresentApp(tk.Tk):
                 )
                 self._engine_var.set("SAPI (Windows)")
                 self._tts = self._tts_sapi
+                self._hide_language_filter()
 
         else:
-            # Default to SAPI
             self._tts = self._tts_sapi
+            self._hide_language_filter()
 
         self._populate_voices()
+
+    def _show_language_filter(self):
+        self._language_label.grid()
+        self._language_combo.grid()
+        self._language_combo.configure(state="readonly")
+
+    def _hide_language_filter(self):
+        self._language_label.grid_remove()
+        self._language_combo.grid_remove()
+        self._language_var.set("")
+
     def _on_language_change(self, event=None):
         self._apply_language_filter()
 
@@ -1321,51 +1346,72 @@ class AutoPresentApp(tk.Tk):
         try:
             voices = self._tts.get_voices_sync()
             self._all_voices = voices
-
-            lang_map = {
-                "en": "English",
-                "zh": "Chinese",
-                "fil": "Filipino / Tagalog",
-                "ja": "Japanese",
-                "ko": "Korean",
-                "es": "Spanish",
-                "fr": "French",
-                "de": "German",
-                "pt": "Portuguese",
-                "it": "Italian",
-                "id": "Indonesian",
-                "vi": "Vietnamese",
-                "th": "Thai",
-                "hi": "Hindi",
-                "ar": "Arabic",
-                "ru": "Russian",
-            }
-
-            languages = []
-            seen = set()
-            for v in voices:
-                code = getattr(v, "language", "en")
-                label = lang_map.get(code, code)
-                if label not in seen:
-                    seen.add(label)
-                    languages.append(label)
-
-            languages = sorted(languages)
+            # Temporary debug
+            # print("Voice count:", len(voices))
+            # print("Sample:", [getattr(v, "id", v.name) for v in voices[:10]])
 
             engine = self._engine_var.get()
+
             if engine == "Azure Speech":
-                self._language_combo.configure(state="readonly")
+                lang_map = {
+                    "en": "English",
+                    "zh": "Chinese",
+                    "fil": "Filipino / Tagalog",
+                    "ja": "Japanese",
+                    "ko": "Korean",
+                    "es": "Spanish",
+                    "fr": "French",
+                    "de": "German",
+                    "pt": "Portuguese",
+                    "it": "Italian",
+                    "id": "Indonesian",
+                    "vi": "Vietnamese",
+                    "th": "Thai",
+                    "hi": "Hindi",
+                    "ar": "Arabic",
+                    "ru": "Russian",
+                }
+
+                languages = []
+                seen = set()
+                for v in voices:
+                    code = getattr(v, "language", "en")
+                    label = lang_map.get(code, code)
+                    if label not in seen:
+                        seen.add(label)
+                        languages.append(label)
+
+                languages = sorted(languages)
+
+                self._show_language_filter()
                 self._language_combo["values"] = languages
+
                 if languages:
                     preferred = ["English", "Chinese", "Filipino / Tagalog"]
-                    chosen = next((p for p in preferred if p in languages), languages[0])
+                    current = self._language_var.get()
+                    if current in languages:
+                        chosen = current
+                    else:
+                        chosen = next((p for p in preferred if p in languages), languages[0])
                     self._language_var.set(chosen)
-            else:
-                self._language_combo.configure(state="disabled")
-                self._language_combo["values"] = []
-                self._language_var.set("")
 
-            self._apply_language_filter()
+                self._apply_language_filter()
+
+            else:
+                # SAPI / Piper: hide language filter, show flat voice list
+                self._hide_language_filter()
+
+                names = [v.name for v in voices]
+                self._voices = voices
+                self._voice_combo["values"] = names
+
+                if names:
+                    self._voice_combo.current(0)
+                    self._voice_var.set(names[0])
+                    self._tts.set_voice(voices[0].id)
+                else:
+                    self._voice_combo.set("")
+                    self._voice_var.set("")
 
         except Exception as e:
             messagebox.showerror("Error", f"Could not load voices:\n{e}")
