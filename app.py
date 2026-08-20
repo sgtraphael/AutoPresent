@@ -8,6 +8,7 @@ from tkinter import filedialog, ttk, messagebox
 import threading
 import time
 import os
+import sys
 
 from pptx import Presentation
 from lxml import etree
@@ -18,7 +19,14 @@ import re
 from dotenv import load_dotenv
 from babel import Locale
 
-load_dotenv()  # Loads the .env file
+def app_dir() -> str:
+    # When frozen by PyInstaller, use the exe folder
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    # When running from source
+    return os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(app_dir(), ".env"))
 
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
@@ -1381,8 +1389,8 @@ class AutoPresentApp(tk.Tk):
             voices = self._tts.get_voices_sync()
             self._all_voices = voices
             # Temporary debug
-            # print("Voice count:", len(voices))
-            # print("Sample:", [getattr(v, "id", v.name) for v in voices[:10]])
+            print("Voice count:", len(voices))
+            print("Sample:", [getattr(v, "id", v.name) for v in voices[:10]])
 
             engine = self._engine_var.get()
 
