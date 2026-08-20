@@ -40,19 +40,24 @@ _PPTX_NSMAP = {
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
 import re
-
 def split_into_chunks(text: str, max_len: int = 40) -> list[str]:
     """
-    Split notes into shorter chunks for more responsive pause/stop.
-    Works better for Chinese by splitting on commas too.
+    Split notes into chunks.
+    - Chinese: shorter chunks for better pause/stop responsiveness
+    - English/others: mainly sentence-level chunks
     """
     if not text or not text.strip():
         return []
 
     text = text.strip()
 
-    # First split by strong punctuation (English + Chinese)
-    parts = re.split(r'(?<=[。！？；.!?;])\s*', text)
+    def is_chinese_text(s: str) -> bool:
+        # If enough CJK characters, treat as Chinese
+        cjk = re.findall(r"[\u4e00-\u9fff]", s)
+        return len(cjk) >= max(1, len(s) // 4)
+
+    # Strong sentence punctuation
+    parts = re.split(r"(?<=[。！？；.!?;])\s*", text)
 
     chunks = []
     for part in parts:
@@ -60,26 +65,30 @@ def split_into_chunks(text: str, max_len: int = 40) -> list[str]:
         if not part:
             continue
 
-        # For longer parts, split further by weak punctuation
-        if len(part) > max_len:
-            small_parts = re.split(r'(?<=[，、,])\s*', part)
+        # Only Chinese gets extra short splitting
+        if is_chinese_text(part) and len(part) > max_len:
+            small_parts = re.split(r"(?<=[，、,])\s*", part)
+
             current = ""
             for sp in small_parts:
                 sp = sp.strip()
                 if not sp:
                     continue
+
+                # Chinese chars are denser; keep chunks shorter
                 if len(current) + len(sp) <= max_len:
                     current = (current + sp).strip()
                 else:
                     if current:
                         chunks.append(current)
                     current = sp
+
             if current:
                 chunks.append(current)
         else:
+            # English / other languages: keep sentence-level chunk
             chunks.append(part)
 
-    # Final cleanup
     return [c.strip() for c in chunks if c.strip()]
 
 # ---------------------------------------------------------------------------
