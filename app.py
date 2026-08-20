@@ -1320,13 +1320,38 @@ class AutoPresentApp(tk.Tk):
         self._voices = voices
         self._voice_combo["values"] = names
 
-        if names:
-            self._voice_combo.current(0)
-            self._voice_var.set(names[0])
-            self._tts.set_voice(voices[0].id)
-        else:
+        if not names:
             self._voice_combo.set("")
             self._voice_var.set("")
+            return
+
+        preferred_ids = [
+            "en-US-JennyNeural",
+            "en-US-AriaNeural",
+            "en-US-GuyNeural",
+        ]
+
+        # Map voice id -> index
+        id_to_index = {
+            getattr(v, "id", ""): i
+            for i, v in enumerate(voices)
+        }
+
+        chosen_index = 0
+        for pref in preferred_ids:
+            if pref in id_to_index:
+                chosen_index = id_to_index[pref]
+                break
+        else:
+            # fallback: name contains Jenny
+            for i, v in enumerate(voices):
+                if "Jenny" in getattr(v, "name", ""):
+                    chosen_index = i
+                    break
+
+        self._voice_combo.current(chosen_index)
+        self._voice_var.set(names[chosen_index])
+        self._tts.set_voice(voices[chosen_index].id)
             
     def _friendly_lang(self, code: str) -> str:
         overrides = {
