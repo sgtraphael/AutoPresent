@@ -449,7 +449,9 @@ class AzureTTSEngine:
         - short_name
         """
         from types import SimpleNamespace
-
+        print(">>> get_voices_sync() called")
+        print(">>> key present:", bool(self.key))
+        print(">>> region:", self.region)
         def make_fallback_voices():
             fallback_names = [
                 # English
@@ -493,6 +495,9 @@ class AzureTTSEngine:
                 audio_config=None
             )
             result = synthesizer.get_voices_async().get()
+            print(">>> reason:", result.reason)
+            print(">>> error_details:", getattr(result, "error_details", None))
+            print(">>> raw voice count:", len(getattr(result, "voices", []) or []))
 
             voices = []
             if result.reason == speechsdk.ResultReason.VoicesListRetrieved:
@@ -509,9 +514,11 @@ class AzureTTSEngine:
                         short_name=v.short_name
                     ))
             else:
+                print(">>> using FALLBACK list")
                 voices = make_fallback_voices()
 
         except Exception:
+            print("Azure get_voices_sync FAILED:", repr(e))
             voices = make_fallback_voices()
 
         voices.sort(key=lambda x: (x.language, x.name.lower()))
@@ -693,7 +700,7 @@ class Presenter:
     """Runs the auto-presentation loop on a background thread."""
 
     def __init__(self, ppt: PPTController, tts: TTSEngine,
-                 on_slide_change, on_status_change, on_finished,on_subtitle_update=None,auto_advance_var=None):
+                 on_slide_change, on_status_change, on_finished,on_subtitle_update=None,auto_advance_var=None,auto_play_var=None,):
         self._ppt = ppt
         self._tts = tts
         self._on_slide_change = on_slide_change   # callback(slide_index)
@@ -708,6 +715,8 @@ class Presenter:
         self._jump_to = None          # target 0-based slide index, or None
         self._jump_event = threading.Event()
         self._auto_advance_var = auto_advance_var
+        self._auto_play_var = auto_play_var
+        self._play_event = threading.Event()
 
     def next_slide(self):
         """Request jump to next slide (called from GUI thread)."""
@@ -749,6 +758,29 @@ class Presenter:
         self._tts.stop()          # stop current speech immediately
         self._pause_event.set()   # make sure it’s not stuck in pause
 
+    def request_play(self):
+        self._play_event.set()
+
+    def _wait_for_play_if_needed(self):
+        auto_play = True
+        if self._auto_play_var is not None:
+            auto_play = self._auto_play_var.get()
+
+        if auto_play:
+            self._play_event.set()
+            return
+
+        self._play_event.clear()
+        if self._on_status_change:
+            self._on_status_change("Waiting for Play…")
+        if self._on_subtitle_update:
+            self._on_subtitle_update("(Waiting for Play...)")
+
+        while not self._play_event.is_set():
+            if self._stop_event.is_set() or self._jump_event.is_set():
+                return
+            time.sleep(0.05)
+
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
@@ -769,7 +801,9 @@ class Presenter:
 
             total = self._ppt.slide_count
             idx = self.current_slide
-
+            self._wait_for_play_if_needed()
+            if self._stop_event.is_set():
+                return
             while idx < total:
                 if self._stop_event.is_set():
                     break
@@ -1175,6 +1209,23 @@ class AutoPresentApp(tk.Tk):
             activeforeground=FG,
             font=("Segoe UI", 9)
         ).grid(row=6, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
+
+
+        # Auto-play checkbox
+        self._auto_play = tk.BooleanVar(value=True)  # default ON
+
+        tk.Checkbutton(
+            settings_frame,
+            text="Auto-play notes",
+            variable=self._auto_play,
+            bg=BG,
+            fg=FG,
+            selectcolor=ENTRY_BG,
+            activebackground=BG,
+            activeforeground=FG,
+            font=("Segoe UI", 9),
+            command=self._on_auto_play_toggle
+        ).grid(row=7, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -1211,6 +1262,15 @@ class AutoPresentApp(tk.Tk):
                                     bg="#a6e3a1", fg="#1e1e2e",
                                     command=self._on_start, **btn_cfg)
         self._start_btn.pack(side="left", padx=4)
+
+        self._play_btn = tk.Button(
+            btn_frame, text="▶  Play",
+            bg="#94e2d5", fg="#1e1e2e",
+            command=self._on_play,
+            state="disabled",
+            **btn_cfg
+        )
+        self._play_btn.pack(side="left", padx=4)
 
         self._pause_btn = tk.Button(btn_frame, text="⏸  Pause",
                                     bg="#f9e2af", fg="#1e1e2e",
@@ -1479,15 +1539,36 @@ class AutoPresentApp(tk.Tk):
             on_finished=self._cb_finished,
             on_subtitle_update=self._cb_subtitle_update,
             auto_advance_var=self._auto_advance,
+            auto_play_var=self._auto_play,
         )
         self._presenter.start(from_slide=start_idx)
 
         self._start_btn.config(state="disabled")
         self._pause_btn.config(state="normal")
         self._stop_btn.config(state="normal")
+        if self._auto_play.get():
+            self._play_btn.config(state="disabled")
+        else:
+            self._play_btn.config(state="normal")
         self._prev_btn.config(state="normal")
         self._next_btn.config(state="normal")
         self._jump_btn.config(state="normal")
+
+    def _on_auto_play_toggle(self):
+        if not (self._presenter and self._presenter.is_running()):
+            self._play_btn.config(state="disabled")
+            return
+
+        if self._auto_play.get():
+            self._play_btn.config(state="disabled")
+            self._presenter.request_play()
+        else:
+            self._play_btn.config(state="normal")
+
+    def _on_play(self):
+        if self._presenter and self._presenter.is_running():
+            self._presenter.request_play()
+            self._play_btn.config(state="disabled")
 
     def _on_pause_resume(self):
         if self._presenter is None:
@@ -1541,6 +1622,7 @@ class AutoPresentApp(tk.Tk):
         self._start_btn.config(state="normal" if self._ppt else "disabled")
         self._pause_btn.config(state="disabled", text="⏸  Pause")
         self._stop_btn.config(state="disabled")
+        self._play_btn.config(state="disabled")
         self._prev_btn.config(state="disabled")
         self._next_btn.config(state="disabled")
         self._jump_btn.config(state="disabled")
