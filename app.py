@@ -1214,7 +1214,7 @@ class AutoPresentApp(tk.Tk):
         # Auto-play checkbox
         self._auto_play = tk.BooleanVar(value=True)  # default ON
 
-        tk.Checkbutton(
+        self._auto_play_chk = tk.Checkbutton(
             settings_frame,
             text="Auto-play notes",
             variable=self._auto_play,
@@ -1225,7 +1225,8 @@ class AutoPresentApp(tk.Tk):
             activeforeground=FG,
             font=("Segoe UI", 9),
             command=self._on_auto_play_toggle
-        ).grid(row=7, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
+        )
+        self._auto_play_chk.grid(row=7, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
@@ -1546,10 +1547,13 @@ class AutoPresentApp(tk.Tk):
         self._start_btn.config(state="disabled")
         self._pause_btn.config(state="normal")
         self._stop_btn.config(state="normal")
+
+        self._auto_play_chk.config(state="disabled")
         if self._auto_play.get():
             self._play_btn.config(state="disabled")
         else:
             self._play_btn.config(state="normal")
+
         self._prev_btn.config(state="normal")
         self._next_btn.config(state="normal")
         self._jump_btn.config(state="normal")
@@ -1625,6 +1629,8 @@ class AutoPresentApp(tk.Tk):
         self._play_btn.config(state="disabled")
         self._prev_btn.config(state="disabled")
         self._next_btn.config(state="disabled")
+        self._play_btn.config(state="disabled")
+        self._auto_play_chk.config(state="normal")
         self._jump_btn.config(state="disabled")
         self._paused = False
 
