@@ -1195,11 +1195,13 @@ class AutoPresentApp(tk.Tk):
         )
         self._jump_btn.pack(side="left", padx=(4, 0))
 
-        # Auto-advance checkbox
-        self._auto_advance = tk.BooleanVar(value=True)
+        # Auto-advance + Auto-play on the same row
+        toggle_frame = tk.Frame(settings_frame, bg=BG)
+        toggle_frame.grid(row=6, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
 
+        self._auto_advance = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            settings_frame,
+            toggle_frame,
             text="Auto-advance to next slide",
             variable=self._auto_advance,
             bg=BG,
@@ -1208,14 +1210,11 @@ class AutoPresentApp(tk.Tk):
             activebackground=BG,
             activeforeground=FG,
             font=("Segoe UI", 9)
-        ).grid(row=6, column=0, columnspan=3, padx=8, pady=(6, 8), sticky="w")
+        ).pack(side="left")
 
-
-        # Auto-play checkbox
-        self._auto_play = tk.BooleanVar(value=True)  # default ON
-
+        self._auto_play = tk.BooleanVar(value=True)
         self._auto_play_chk = tk.Checkbutton(
-            settings_frame,
+            toggle_frame,
             text="Auto-play notes",
             variable=self._auto_play,
             bg=BG,
@@ -1226,7 +1225,7 @@ class AutoPresentApp(tk.Tk):
             font=("Segoe UI", 9),
             command=self._on_auto_play_toggle
         )
-        self._auto_play_chk.grid(row=7, column=0, columnspan=3, padx=8, pady=(0, 8), sticky="w")
+        self._auto_play_chk.pack(side="left", padx=(18, 0))
         # ---- Progress / status ----
         prog_frame = tk.Frame(self, bg=BG)
         prog_frame.grid(row=2, column=0, columnspan=3,
