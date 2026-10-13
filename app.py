@@ -812,11 +812,13 @@ class Presenter:
                 if self._stop_event.is_set():
                     break
 
+                from_jump = False
                 if self._jump_event.is_set():
                     self._jump_event.clear()
                     if self._jump_to is not None and 0 <= self._jump_to < total:
                         idx = self._jump_to
                     self._jump_to = None
+                    from_jump = True
 
                 self.current_slide = idx
                 slide_num = idx + 1
@@ -824,6 +826,14 @@ class Presenter:
                 self._ppt.goto_slide(slide_num)
                 self._on_slide_change(idx)
                 self._on_status_change(f"Slide {slide_num} / {total}")
+
+                if from_jump and self._auto_play_var is not None and not self._auto_play_var.get():
+                    self._play_event.clear()
+                    self._wait_for_play_if_needed()
+                    if self._stop_event.is_set():
+                        break
+                    if self._jump_event.is_set():
+                        continue
 
                 notes = self._ppt.get_notes(idx)
 
@@ -1640,6 +1650,8 @@ class AutoPresentApp(tk.Tk):
 
     def _cb_status(self, message: str):
         self.after(0, self._status_var.set, message)
+        if message == "Waiting for Play…":
+            self.after(0, lambda: self._play_btn.config(state="normal"))
 
     def _cb_finished(self):
         self.after(0, self._on_presentation_finished)
