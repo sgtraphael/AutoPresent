@@ -5,6 +5,7 @@ Reads slide notes aloud and automatically advances to the next slide.
 
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
+import html
 import threading
 import time
 import os
@@ -48,56 +49,17 @@ _PPTX_NSMAP = {
     'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
 }
 import re
-def split_into_chunks(text: str, max_len: int = 40) -> list[str]:
+
+def split_into_chunks(text: str) -> list[str]:
     """
-    Split notes into chunks.
-    - Chinese: shorter chunks for better pause/stop responsiveness
-    - English/others: mainly sentence-level chunks
+    Split notes into sentence-level chunks.
+    Commas stay inside the sentence so the voice can pause on them.
     """
     if not text or not text.strip():
         return []
 
-    text = text.strip()
-
-    def is_chinese_text(s: str) -> bool:
-        # If enough CJK characters, treat as Chinese
-        cjk = re.findall(r"[\u4e00-\u9fff]", s)
-        return len(cjk) >= max(1, len(s) // 4)
-
-    # Strong sentence punctuation
-    parts = re.split(r"(?<=[。！？；.!?;])\s*", text)
-
-    chunks = []
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-
-        # Only Chinese gets extra short splitting
-        if is_chinese_text(part) and len(part) > max_len:
-            small_parts = re.split(r"(?<=[，、,])\s*", part)
-
-            current = ""
-            for sp in small_parts:
-                sp = sp.strip()
-                if not sp:
-                    continue
-
-                # Chinese chars are denser; keep chunks shorter
-                if len(current) + len(sp) <= max_len:
-                    current = (current + sp).strip()
-                else:
-                    if current:
-                        chunks.append(current)
-                    current = sp
-
-            if current:
-                chunks.append(current)
-        else:
-            # English / other languages: keep sentence-level chunk
-            chunks.append(part)
-
-    return [c.strip() for c in chunks if c.strip()]
+    parts = re.split(r"(?<=[。！？；.!?;])\s*", text.strip())
+    return [part.strip() for part in parts if part.strip()]
 
 # ---------------------------------------------------------------------------
 # TTS Engine wrapper (lives on a dedicated thread)
@@ -426,6 +388,7 @@ class AzureTTSEngine:
         self._is_speaking = False
         self._stop_requested = False
         self._synthesizer = None
+        self._speak_token = None
 
         self._speech_config = speechsdk.SpeechConfig(
             subscription=key,
@@ -540,11 +503,20 @@ class AzureTTSEngine:
         percent = max(0, min(100, percent))
         self._volume = f"{percent}%"
 
+    def _ssml_lang(self) -> str:
+        """Locale prefix of the selected voice, e.g. zh-CN-XiaoxiaoNeural -> zh-CN."""
+        parts = (self._voice or "").split("-")
+        if len(parts) >= 2 and len(parts[0]) >= 2 and len(parts[1]) >= 2:
+            return f"{parts[0]}-{parts[1]}"
+        return "en-US"
+
     def _build_ssml(self, text: str) -> str:
-        return f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>
+        safe_text = html.escape(text, quote=False)
+        lang = self._ssml_lang()
+        return f"""<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='{lang}'>
             <voice name='{self._voice}'>
                 <prosody rate='{self._rate}' volume='{self._volume}'>
-                    {text}
+                    {safe_text}
                 </prosody>
             </voice>
         </speak>"""
@@ -558,19 +530,23 @@ class AzureTTSEngine:
 
                 self._is_speaking = True
                 self._speech_config.speech_synthesis_voice_name = self._voice
-
-                self._synthesizer = speechsdk.SpeechSynthesizer(
-                    speech_config=self._speech_config
-                )
-
+                if self._synthesizer is None:
+                    self._synthesizer = speechsdk.SpeechSynthesizer(
+                        speech_config=self._speech_config
+                    )
+                synthesizer = self._synthesizer
                 ssml = self._build_ssml(text)
+                token = object()
+                self._speak_token = token
 
-                try:
-                    result = self._synthesizer.speak_ssml_async(ssml).get()
-                except Exception:
-                    pass
-                finally:
-                    self._is_speaking = False
+            try:
+                synthesizer.speak_ssml_async(ssml).get()
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    if self._speak_token is token:
+                        self._is_speaking = False
 
         self._stop_requested = False
         threading.Thread(target=_speak, daemon=True).start()
@@ -579,11 +555,12 @@ class AzureTTSEngine:
         with self._lock:
             self._stop_requested = True
             self._is_speaking = False
-            if self._synthesizer is not None:
-                try:
-                    self._synthesizer.stop_speaking_async()
-                except Exception:
-                    pass
+            synthesizer = self._synthesizer
+        if synthesizer is not None:
+            try:
+                synthesizer.stop_speaking_async()
+            except Exception:
+                pass
 
     def is_speaking(self) -> bool:
         return self._is_speaking
