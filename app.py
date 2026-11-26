@@ -50,13 +50,6 @@ _PPTX_NSMAP = {
 }
 import re
 
-def is_chinese_text(s: str) -> bool:
-    """True when enough of the text is CJK to treat it as Chinese."""
-    if not s:
-        return False
-    cjk = re.findall(r"[\u4e00-\u9fff]", s)
-    return len(cjk) >= max(1, len(s) // 4)
-
 def split_into_chunks(text: str) -> list[str]:
     """
     Split notes into sentence-level chunks.
@@ -765,29 +758,6 @@ class Presenter:
                 return
             time.sleep(0.05)
 
-    def _wait_chinese_sentence_gap(self, seconds: float = 0.4) -> bool:
-        """Wait between Chinese sentences. Returns False if stop or jump fired."""
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if self._stop_event.is_set() or self._jump_event.is_set():
-                return False
-            if not self._pause_event.is_set():
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.05, remaining))
-
-        if self._stop_event.is_set() or self._jump_event.is_set():
-            return False
-
-        while not self._pause_event.is_set():
-            if self._stop_event.is_set() or self._jump_event.is_set():
-                return False
-            time.sleep(0.05)
-
-        return not self._stop_event.is_set() and not self._jump_event.is_set()
-
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
@@ -892,12 +862,6 @@ class Presenter:
                             continue
 
                         chunk_idx += 1
-                        if (
-                            chunk_idx < len(chunks)
-                            and is_chinese_text(chunks[chunk_idx - 1])
-                            and not self._wait_chinese_sentence_gap()
-                        ):
-                            break
                 else:
                     self._on_status_change(
                         f"Slide {slide_num} / {total}  —  No notes, waiting 3 s…"
